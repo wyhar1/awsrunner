@@ -35,6 +35,84 @@ namespace ssl   = asio::ssl;
 using tcp = asio::ip::tcp;
 
 static std::mutex out_mtx;
+static std::string g_pm_yes_token;
+static std::string g_pm_no_token;
+static std::string g_pm_market_hex; // e.g. 0x7368... used by WS 'market' channel
+
+// Canonical KalshiMarketInfo definition (placed early)
+struct KalshiMarketInfo {
+    std::string subscribe_ticker;
+    std::string market_type;
+    std::string contract_code;
+    double best_bid = 0.0;
+    double best_ask = 0.0;
+};
+
+// Move QuoteBook above forward declarations so it's known
+struct QuoteBook {
+    std::mutex m;
+    std::optional<double> best_bid;
+    std::optional<double> best_ask;
+    std::chrono::steady_clock::time_point last_update = std::chrono::steady_clock::now();
+    void set_bid(double v){ std::lock_guard lk(m); best_bid = v; last_update = std::chrono::steady_clock::now(); }
+    void set_ask(double v){ std::lock_guard lk(m); best_ask = v; last_update = std::chrono::steady_clock::now(); }
+    void set_bbo(double bid, double ask){ std::lock_guard lk(m); best_bid = bid; best_ask = ask; last_update = std::chrono::steady_clock::now(); }
+    struct Snapshot { std::optional<double> bid, ask; std::chrono::steady_clock::time_point ts; };
+    Snapshot snap() { std::lock_guard lk(m); return {best_bid, best_ask, last_update}; }
+};
+
+// PMBook represents a simple best-bid/best-ask snapshot from Polymarket CLOB
+struct PMBook {
+    std::optional<double> best_bid;
+    std::optional<double> best_ask;
+};
+
+// Forward declaration for PM REST fallback (definition now present above)
+static PMBook fetch_pm_clob_book(const std::string &token_id);
+
+// Forward declarations for functions used in main (remove stray forward decl of KalshiMarketInfo)
+websocket::stream<beast::ssl_stream<beast::tcp_stream>> connect_wss(
+    asio::io_context& ioc,
+    ssl::context& sslctx,
+    const std::string& host_for_tcp,
+    const std::string& port,
+    const std::string& target,
+    const std::string& sni_host,
+    const std::vector<std::pair<std::string,std::string>>& extra_headers);
+
+std::optional<std::pair<double,double>> fetch_kx_orderbook_snapshot(
+    const std::string& ticker,
+    const std::string& key_id,
+    EVP_PKEY* pkey);
+
+std::optional<KalshiMarketInfo> hydrate_and_normalize_kx_market(
+    const std::string& raw_ticker,
+    const std::string& key_id,
+    EVP_PKEY* pkey);
+
+// Forward declaration for PM REST fallback
+struct PMBook;
+static PMBook fetch_pm_clob_book(const std::string &token_id);
+
+void run_ws_watch(
+    const std::string &ws_url,
+    const std::function<std::vector<std::pair<std::string,std::string>>()> &header_supplier,
+    const std::vector<std::string> &subscribe_candidates,
+    const std::string &alt_subscribe_json,
+    const std::string &snapshot_json,
+    QuoteBook &qb,
+    const std::string &label,
+    std::atomic<bool> &stop_flag,
+    bool verbose,
+    const std::string &host_override,
+    const std::string &sni_host_override);
+
+void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
+                    int pm_fee_bps, int kx_fee_bps, int min_edge_bps,
+                    std::atomic<bool> &stop_flag,
+                    int stale_ms, int max_skew_ms, int ping_ms,
+                    const std::string& windows_csv,
+                    bool verbose);
 
 // ----- Kalshi orderbook maintenance (for delta updates) -----
 struct KalshiBook {
@@ -329,25 +407,15 @@ static bool icontains(const std::string& hay, const std::string& needle) {
 
 // ----- HMAC-SHA256 hex -----
 std::string hmac_sha256_hex(const std::string &key, const std::string &msg) {
-    unsigned char *result;
-    unsigned int len = EVP_MAX_MD_SIZE;
-    result = HMAC(EVP_sha256(),
-                  (const unsigned char*)key.data(), (int)key.size(),
-                  (const unsigned char*)msg.data(), (int)msg.size(),
-                  nullptr, nullptr);
-    // HMAC returns static pointer, use separate call to get length
     unsigned char md[EVP_MAX_MD_SIZE];
     unsigned int md_len = 0;
     HMAC(EVP_sha256(),
          (const unsigned char*)key.data(), (int)key.size(),
-         (const unsigned char*)msg.data(), (int)msg.size(),
+        (const unsigned char*)msg.data(), (int)msg.size(),
          md, &md_len);
-
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
-    for (unsigned int i=0;i<md_len;++i) {
-        oss << std::setw(2) << (int)md[i];
-    }
+    for (unsigned int i=0;i<md_len;++i) oss << std::setw(2) << (int)md[i];
     return oss.str();
 }
 
@@ -372,38 +440,7 @@ std::vector<std::pair<std::string,std::string>> make_kalshi_auth_headers(const K
 }
 
 // ----- shared state for best quotes -----
-struct QuoteBook {
-    std::mutex m;
-    std::optional<double> best_bid;
-    std::optional<double> best_ask;
-    std::chrono::steady_clock::time_point last_update = std::chrono::steady_clock::now();
-
-    void set_bid(double v){
-        std::lock_guard lk(m);
-        best_bid = v;
-        last_update = std::chrono::steady_clock::now();
-    }
-    void set_ask(double v){
-        std::lock_guard lk(m);
-        best_ask = v;
-        last_update = std::chrono::steady_clock::now();
-    }
-    // Use this when both sides are updated together
-    void set_bbo(double bid, double ask){
-        std::lock_guard lk(m);
-        best_bid = bid;
-        best_ask = ask;
-        last_update = std::chrono::steady_clock::now();
-    }
-    struct Snapshot {
-        std::optional<double> bid, ask;
-        std::chrono::steady_clock::time_point ts;
-    };
-    Snapshot snap() {
-        std::lock_guard lk(m);
-        return {best_bid, best_ask, last_update};
-    }
-};
+// NOTE: `QuoteBook` is defined near the top of this file; do not redeclare it here.
 
 // ----- helpers to scan arrays of price levels -----
 static std::optional<double> max_price_in_levels(const json& arr) {
@@ -601,6 +638,7 @@ std::optional<double> extract_best_ask(const json &j) {
 struct PMTokens {
     std::string yes_token;
     std::string no_token;
+    std::string market_hex; // questionID from Gamma API
 };
 
 std::optional<PMTokens> fetch_pm_tokens(const std::string& market_id) {
@@ -679,6 +717,10 @@ std::optional<PMTokens> fetch_pm_tokens(const std::string& market_id) {
             }
         }
 
+        // capture questionID/market hex if present (used by WS market subscription)
+        if (m.contains("questionID") && m["questionID"].is_string()) {
+            t.market_hex = m["questionID"].get<std::string>();
+        }
         if (!t.yes_token.empty() || !t.no_token.empty()) return t;
     } catch (const std::exception& e) {
         std::cerr << "[PM] Failed to fetch tokens: " << e.what() << std::endl;
@@ -699,8 +741,8 @@ std::optional<std::string> fetch_kalshi_market_ticker_from_event(
         ssl::context sslctx(ssl::context::tlsv12_client);
         sslctx.set_default_verify_paths();
 
-        // Use api.kalshi.com for REST endpoints
-        const std::string host = "api.kalshi.com";
+        // Use api.elections.kalshi.com for REST endpoints
+        const std::string host = "api.elections.kalshi.com";
 
         tcp::resolver resolver{ioc};
         auto const results = resolver.resolve(host, "443");
@@ -715,7 +757,6 @@ std::optional<std::string> fetch_kalshi_market_ticker_from_event(
         tls_stream.handshake(ssl::stream_base::client);
 
         // Kalshi v2 markets endpoint (event_ticker filter)
-        // Important: the path (including query) must be what we sign.
         const std::string path = "/trade-api/v2/markets?event_ticker=" + event_ticker;
 
         // Build RSA-PSS headers (timestamp + "GET" + path)
@@ -724,7 +765,6 @@ std::optional<std::string> fetch_kalshi_market_ticker_from_event(
         http::request<http::string_body> req{http::verb::get, path, 11};
         req.set(http::field::host, host);
         req.set(http::field::user_agent, "arb-ws-watcher/1.0");
-        // Kalshi REST also needs these access headers:
         for (auto& h : headers) req.set(h.first, h.second);
 
         http::write(tls_stream, req);
@@ -734,7 +774,8 @@ std::optional<std::string> fetch_kalshi_market_ticker_from_event(
         http::read(tls_stream, buffer, res);
         if (res.result() != http::status::ok) {
             std::lock_guard lk(out_mtx);
-            std::cerr << "[KX] REST /markets HTTP " << static_cast<unsigned>(res.result()) << "\n";
+            std::cerr << "[KX] REST /markets HTTP " << static_cast<unsigned>(res.result())
+                      << " body=" << res.body() << "\n";
             return std::nullopt;
         }
 
@@ -750,7 +791,7 @@ std::optional<std::string> fetch_kalshi_market_ticker_from_event(
             return std::nullopt;
         }
 
-        // Pick the "Winner"/moneyline market if available; else first market.
+        // Pick a reasonable market ticker (prefer WINNER/MONEYLINE if present)
         std::string best;
         for (const auto& m : *arr) {
             if (!m.is_object()) continue;
@@ -758,15 +799,12 @@ std::optional<std::string> fetch_kalshi_market_ticker_from_event(
             std::string title  = m.value("title", "");
             if (ticker.empty()) continue;
 
-            // Prefer WINNER / MONEYLINE / YES-NO style tickers
             if (icontains(ticker, "WINNER") || icontains(title, "winner") ||
                 icontains(title, "moneyline") || icontains(ticker, "MONEYLINE")) {
                 best = ticker;
                 break;
             }
-
-            // As a secondary heuristic, prefer markets ending with ".WINNER.*"
-            if (best.empty()) best = ticker;
+            if (best.empty()) best = ticker; // fallback to first
         }
 
         if (!best.empty()) return best;
@@ -777,929 +815,42 @@ std::optional<std::string> fetch_kalshi_market_ticker_from_event(
     return std::nullopt;
 }
 
-// ----- Kalshi market hydration and normalization -----
-struct KalshiMarketInfo {
-    std::string subscribe_ticker;  // Actual ticker to subscribe to (may be contract ticker)
-    std::string market_type;       // "binary" or "categorical"
-    std::string contract_code;     // "YES", "O", "U", etc.
-    double best_bid = 0.0;
-    double best_ask = 0.0;
-};
-
-std::optional<KalshiMarketInfo> hydrate_and_normalize_kx_market(
-    const std::string& raw_ticker,
-    const std::string& key_id,
-    EVP_PKEY* pkey)
-{
-    if (raw_ticker.empty() || key_id.empty() || !pkey) return std::nullopt;
-
-    try {
-        // Helper to fetch market by ticker
-        auto fetch_market = [&](const std::string& ticker) -> std::optional<json> {
-            asio::io_context ioc;
-            ssl::context sslctx(ssl::context::tlsv12_client);
-            sslctx.set_default_verify_paths();
-
-            // Use api.kalshi.com for REST endpoints
-            const std::string host = "api.kalshi.com";
-
-            tcp::resolver resolver{ioc};
-            auto results = resolver.resolve(host, "443");
-            beast::tcp_stream tcp_stream{ioc};
-            tcp_stream.connect(results);
-
-            beast::ssl_stream<beast::tcp_stream> tls_stream{std::move(tcp_stream), sslctx};
-            if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str()))
-                return std::nullopt;
-
-            beast::get_lowest_layer(tls_stream).expires_after(std::chrono::seconds(30));
-            tls_stream.handshake(ssl::stream_base::client);
-
-            std::string path = "/trade-api/v2/markets?ticker=" + ticker;
-            auto headers = make_kalshi_auth_headers(key_id, pkey, path);
-
-            http::request<http::string_body> req{http::verb::get, path, 11};
-            req.set(http::field::host, host);
-            req.set(http::field::user_agent, "arb-ws-watcher/1.0");
-            for (auto& h : headers) req.set(h.first, h.second);
-
-            http::write(tls_stream, req);
-
-            beast::flat_buffer buffer;
-            http::response<http::string_body> res;
-            http::read(tls_stream, buffer, res);
-
-            if (res.result() != http::status::ok) return std::nullopt;
-
-            return json::parse(res.body());
-        };
-
-        // Try exact ticker first
-        std::vector<std::string> candidates = {raw_ticker};
-
-        // Generate alternates for common ticker variations
-        if (raw_ticker.find("-TOTAL-O") != std::string::npos) {
-            candidates.push_back(std::regex_replace(raw_ticker, std::regex("-TOTAL-O"), "-TOTAL-"));
-            candidates.push_back(std::regex_replace(raw_ticker, std::regex("-TOTAL-O"), "-TOTAL-OVER-"));
-            candidates.push_back(std::regex_replace(raw_ticker, std::regex("-TOTAL-O"), "-OVER-"));
-        }
-        if (raw_ticker.find("-TOTAL-U") != std::string::npos) {
-            candidates.push_back(std::regex_replace(raw_ticker, std::regex("-TOTAL-U"), "-TOTAL-"));
-            candidates.push_back(std::regex_replace(raw_ticker, std::regex("-TOTAL-U"), "-TOTAL-UNDER-"));
-            candidates.push_back(std::regex_replace(raw_ticker, std::regex("-TOTAL-U"), "-UNDER-"));
-        }
-        if (raw_ticker.find("-1H-TOTAL-") != std::string::npos) {
-            candidates.push_back(std::regex_replace(raw_ticker, std::regex("-1H-TOTAL-"), "-TOTAL-1H-"));
-        }
-
-        json market_data;
-        std::string found_ticker;
-
-        for (const auto& candidate : candidates) {
-            auto resp = fetch_market(candidate);
-            if (resp && resp->is_object() && resp->contains("markets")) {
-                auto& markets = (*resp)["markets"];
-                if (markets.is_array() && !markets.empty()) {
-                    // NEW: pick the first with exact ticker match to avoid wrong markets
-                    std::optional<json> exact;
-                    for (const auto& m : markets) {
-                        if (m.is_object() && m.contains("ticker") && m["ticker"].is_string()) {
-                            if (m["ticker"].get<std::string>() == candidate) {
-                                exact = m;
-                                break;
-                            }
-                        }
-                    }
-                    if (!exact) {
-                        std::lock_guard lk(out_mtx);
-                        std::cerr << "[KX] Market response didn't match requested ticker " << candidate << ", trying next\n";
-                        continue; // keep trying other candidates
-                    }
-
-                    market_data = *exact;
-                    found_ticker = candidate;
-                    std::lock_guard lk(out_mtx);
-                    std::cout << "[KX] Found market: " << candidate << "\n";
-                    break;
-                }
-            }
-        }
-
-        if (market_data.empty()) {
-            std::lock_guard lk(out_mtx);
-            std::cerr << "[KX] Market not found: tried " << candidates.size() << " variations\n";
-            return std::nullopt;
-        }
-
-        KalshiMarketInfo info;
-        std::string mtype = market_data.value("market_type", "");
-        info.market_type = mtype;
-
-        if (mtype == "categorical") {
-            // Categorical market (e.g., O/U total) - need to pick specific contract
-            std::lock_guard lk(out_mtx);
-            std::cout << "[KX] Categorical market detected, selecting contract...\n";
-
-            // Determine which contract we want (O vs U)
-            bool want_over = (raw_ticker.find("-O") != std::string::npos ||
-                            raw_ticker.find("OVER") != std::string::npos);
-            bool want_under = (raw_ticker.find("-U") != std::string::npos ||
-                             raw_ticker.find("UNDER") != std::string::npos);
-
-            if (!market_data.contains("contracts") || !market_data["contracts"].is_array()) {
-                std::cerr << "[KX] No contracts found in categorical market\n";
-                return std::nullopt;
-            }
-
-            // Find the right contract
-            for (const auto& contract : market_data["contracts"]) {
-                std::string code = contract.value("code", "");
-                std::string display = contract.value("display", "");
-
-                bool is_over = (code == "O" || code == "OVER" || display == "Over");
-                bool is_under = (code == "U" || code == "UNDER" || display == "Under");
-
-                if ((want_over && is_over) || (want_under && is_under) ||
-                    (!want_over && !want_under && is_over)) {  // default to Over
-                    info.subscribe_ticker = contract.value("ticker", "");
-                    info.contract_code = code;
-                    std::cout << "[KX] Selected contract: " << info.contract_code
-                              << " (ticker=" << info.subscribe_ticker << ")\n";
-                    break;
-                }
-            }
-
-            if (info.subscribe_ticker.empty()) {
-                std::cerr << "[KX] Could not find matching contract\n";
-                return std::nullopt;
-            }
-        } else {
-            // Binary market: subscribe with the exact market ticker we queried
-            info.subscribe_ticker = found_ticker; // critical to avoid wrong topic
-            info.contract_code = "YES";
-        }
-
-        return info;
-
-    } catch (const std::exception& e) {
-        std::lock_guard lk(out_mtx);
-        std::cerr << "[KX] Market hydration failed: " << e.what() << "\n";
-    }
-    return std::nullopt;
-}
-
-// ----- Fetch orderbook snapshot to seed quotes -----
-std::optional<std::pair<double,double>> fetch_kx_orderbook_snapshot(
-    const std::string& ticker,
-    const std::string& key_id,
-    EVP_PKEY* pkey)
-{
-    if (ticker.empty() || key_id.empty() || !pkey) return std::nullopt;
-
-    try {
-        asio::io_context ioc;
-        ssl::context sslctx(ssl::context::tlsv12_client);
-        sslctx.set_default_verify_paths();
-
-        // Use api.kalshi.com for REST endpoints (api.elections.* returns 404 for market_orderbook)
-        const std::string host = "api.kalshi.com";
-
-        tcp::resolver resolver{ioc};
-        auto results = resolver.resolve(host, "443");
-        beast::tcp_stream tcp_stream{ioc};
-        tcp_stream.connect(results);
-
-        beast::ssl_stream<beast::tcp_stream> tls_stream{std::move(tcp_stream), sslctx};
-        if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str()))
-            return std::nullopt;
-
-        beast::get_lowest_layer(tls_stream).expires_after(std::chrono::seconds(30));
-        tls_stream.handshake(ssl::stream_base::client);
-
-        // ✅ Correct v2 route + param name
-        // Was: "/trade-api/v2/orderbook?ticker=" + ticker
-        const std::string path = "/trade-api/v2/market_orderbook?market_ticker=" + ticker;
-
-        // Sign EXACTLY this path
-        auto headers = make_kalshi_auth_headers(key_id, pkey, path);
-
-        // Log what we're requesting for debugging
-        {
-            std::lock_guard lk(out_mtx);
-            std::cout << "[KX] Snapshot request: https://" << host << path << "\n";
-        }
-
-        http::request<http::string_body> req{http::verb::get, path, 11};
-        req.set(http::field::host, host);
-        req.set(http::field::user_agent, "arb-ws-watcher/1.0");
-        for (auto& h : headers) req.set(h.first, h.second);
-
-        http::write(tls_stream, req);
-
-        beast::flat_buffer buffer;
-        http::response<http::string_body> res;
-        http::read(tls_stream, buffer, res);
-
-        if (res.result() != http::status::ok) {
-            std::lock_guard lk(out_mtx);
-            std::cerr << "[KX] SNAPSHOT HTTP " << static_cast<unsigned>(res.result())
-                      << " body=" << res.body().substr(0, 300) << "\n";
-            return std::nullopt;
-        }
-
-        auto j = json::parse(res.body());
-
-        // The REST returns either:
-        //  { "orderbook": { ... bids_dollars/asks_dollars ... } }
-        // or a flat object with best_bid/best_ask/yes_bid/yes_ask, etc.
-        const json* payload = &j;
-        if (j.is_object() && j.contains("orderbook") && j["orderbook"].is_object()) {
-            payload = &j["orderbook"];
-        }
-
-        double bid = 0.0, ask = 0.0;
-
-        // 1) Try nested extractor (handles bids/asks, *_dollars, *_cents, etc.)
-        if (extract_bbo_from_nested(*payload, bid, ask)) {
-            std::lock_guard lk(out_mtx);
-            std::cout << "[KX] Snapshot loaded: bid=" << bid << " ask=" << ask << "\n";
-            return std::make_pair(bid, ask);
-        }
-
-        // 2) Try simple fields (best_bid/best_ask or yes_bid/yes_ask)
-        if (payload->contains("best_bid") && (*payload)["best_bid"].is_number())
-            bid = (*payload)["best_bid"].get<double>();
-        else if (payload->contains("yes_bid") && (*payload)["yes_bid"].is_number())
-            bid = (*payload)["yes_bid"].get<double>();
-
-        if (payload->contains("best_ask") && (*payload)["best_ask"].is_number())
-            ask = (*payload)["best_ask"].get<double>();
-        else if (payload->contains("yes_ask") && (*payload)["yes_ask"].is_number())
-            ask = (*payload)["yes_ask"].get<double>();
-
-        if (bid > 0 && ask > 0) {
-            std::lock_guard lk(out_mtx);
-            std::cout << "[KX] Snapshot loaded (simple): bid=" << bid << " ask=" << ask << "\n";
-            return std::make_pair(bid, ask);
-        } else {
-            std::lock_guard lk(out_mtx);
-            std::cerr << "[KX] Snapshot present but no usable quotes. Head: "
-                      << j.dump().substr(0, 300) << "...\n";
-        }
-
-    } catch (const std::exception& e) {
-        std::lock_guard lk(out_mtx);
-        std::cerr << "[KX] Snapshot fetch failed: " << e.what() << "\n";
-    }
-    return std::nullopt;
-}
-
-// ----- Helper to extract bid/ask from Kalshi messages (multiple field names) -----
-static inline double kx_getBid(const json& j) {
-    if (j.contains("best_bid") && j["best_bid"].is_number())
-        return j["best_bid"].get<double>();
-    if (j.contains("yes_bid") && j["yes_bid"].is_number())
-        return j["yes_bid"].get<double>();
-    return std::nan("");
-}
-
-static inline double kx_getAsk(const json& j) {
-    if (j.contains("best_ask") && j["best_ask"].is_number())
-        return j["best_ask"].get<double>();
-    if (j.contains("yes_ask") && j["yes_ask"].is_number())
-        return j["yes_ask"].get<double>();
-    return std::nan("");
-}
-
-// ----- connect & listen WS using correct Beast TLS handshake -----
-websocket::stream<beast::ssl_stream<beast::tcp_stream>> connect_wss(
-    asio::io_context& ioc,
-    ssl::context& sslctx,
-    const std::string& host_for_tcp,  // Can be IP address if DNS fails
-    const std::string& port,
-    const std::string& target,
-    const std::string& sni_host,      // Hostname for SNI and Host header
-    const std::vector<std::pair<std::string,std::string>>& extra_headers = {})
-{
-    // 1) resolve + connect TCP (can use IP if host_for_tcp is an IP)
-    tcp::resolver resolver{ioc};
-    beast::error_code res_ec;
-    auto const results = resolver.resolve(host_for_tcp, port, res_ec);
-    if (res_ec) {
-        std::lock_guard lk(out_mtx);
-        std::cerr << "[RESOLVE] host=" << host_for_tcp << " port=" << port
-                  << " ec=" << res_ec.message() << " (" << res_ec.value() << ")\n";
-        throw beast::system_error(res_ec);
-    }
-
-    beast::tcp_stream tcp_stream{ioc};
-    tcp_stream.connect(results);
-
-    // 2) wrap in TLS
-    beast::ssl_stream<beast::tcp_stream> tls_stream{std::move(tcp_stream), sslctx};
-
-    // Set SNI hostname (required by many servers)
-    if(!SSL_set_tlsext_host_name(tls_stream.native_handle(), sni_host.c_str()))
-        throw std::runtime_error("SSL_set_tlsext_host_name failed");
-
-    // Optional: timeout on the lowest layer during handshakes
-    beast::get_lowest_layer(tls_stream).expires_after(std::chrono::seconds(30));
-
-    // 3) TLS handshake
-    tls_stream.handshake(ssl::stream_base::client);
-
-    // 4) Upgrade to WebSocket over TLS
-    websocket::stream<beast::ssl_stream<beast::tcp_stream>> ws{std::move(tls_stream)};
-
-    // 5) Set decorator for custom headers (especially for Kalshi RSA-PSS headers)
-    ws.set_option(websocket::stream_base::decorator(
-        [&](websocket::request_type& req){
-            req.set(http::field::host, sni_host);  // Host header = SNI host
-            req.set(http::field::user_agent, "arb-ws-watcher/1.0");
-            // Some gateways require Origin:
-            if (sni_host.find("kalshi") != std::string::npos) {
-                req.set(http::field::origin, "https://kalshi.com");
-            }
-            if (sni_host.find("polymarket") != std::string::npos) {
-                req.set(http::field::origin, "https://polymarket.com");
-            }
-            // Add any extra headers (e.g., Kalshi RSA-PSS auth headers)
-            for (const auto& h : extra_headers) {
-                req.set(h.first, h.second);
-            }
-            {
-                std::lock_guard lk(out_mtx);
-                std::cerr << "[WS] upgrading host=" << host_for_tcp
-                          << " sni=" << sni_host
-                          << " target=" << req.target() << '\n';
-            }
-        }
-    ));
-
-    // 6) WebSocket handshake with response capture
-    websocket::response_type hs_res;
-    beast::error_code hs_ec;
-    ws.handshake(hs_res, sni_host, target, hs_ec);
-    if (hs_ec) {
-        std::lock_guard lk(out_mtx);
-        std::cerr << "[WS] handshake failed host=" << host_for_tcp
-                  << " sni=" << sni_host
-                  << " target=" << target
-                  << " status=" << static_cast<unsigned>(hs_res.result())
-                  << " reason=" << hs_res.reason() << " ec=" << hs_ec.message() << "\n";
-
-        // dump headers for debugging
-        for (auto const& f : hs_res.base()) {
-            std::cerr << "  " << f.name_string() << ": " << f.value() << "\n";
-        }
-        throw beast::system_error(hs_ec);
-    }
-
-    return ws;
-}
-
-void run_ws_watch(
-    const std::string &ws_url,
-    const std::function<std::vector<std::pair<std::string,std::string>>()> &header_supplier,
-    const std::string &subscribe_json,
-    const std::string &alt_subscribe_json,  // for KX alternate format
-    const std::string &snapshot_json,       // for KX snapshot request
-    QuoteBook &qb,
-    const std::string &label,
-    std::atomic<bool> &stop_flag,
-    bool verbose,
-    const std::string &host_override = "",  // Optional: IP to bypass DNS
-    const std::string &sni_host_override = "")  // Optional: SNI hostname
-{
-    int attempt = 0;
-    while (!stop_flag.load()) {
-        try {
-            // parse URL
-            std::string host, port, target;
-            // minimal parse for wss://
-            if (ws_url.rfind("wss://",0) != 0) {
-                throw std::runtime_error("Only wss:// URLs supported");
-            }
-            std::string rest = ws_url.substr(6); // after "wss://"
-
-            auto slash = rest.find('/');
-            if (slash == std::string::npos) {
-                host = rest;
-                target = "/";
-            } else {
-                host = rest.substr(0, slash);
-                target = rest.substr(slash);
-            }
-
-            auto colon = host.find(':');
-            if (colon != std::string::npos) {
-                port = host.substr(colon+1);
-                host = host.substr(0, colon);
-            } else {
-                port = "443";
-            }
-
-
-            asio::io_context ioc;
-            ssl::context sslctx(ssl::context::tlsv12_client);
-            sslctx.set_default_verify_paths();
-
-            // NEW: fetch fresh headers each attempt (fresh timestamp/signature)
-            auto handshake_headers = header_supplier ? header_supplier()
-                                                     : std::vector<std::pair<std::string,std::string>>{};
-
-            // Log what we're connecting to
-            {
-                std::lock_guard lk(out_mtx);
-                std::cout << "["<<label<<"] Connecting to wss://" << host << target << "\n";
-            }
-
-            // Determine actual TCP host and SNI host (support IP override for DNS bypass)
-            std::string tcp_host = host_override.empty() ? host : host_override;
-            std::string sni_hostname = sni_host_override.empty() ? host : sni_host_override;
-
-            if (!host_override.empty()) {
-                std::lock_guard lk(out_mtx);
-                std::cout << "["<<label<<"] Using host override: tcp=" << tcp_host
-                          << " sni=" << sni_hostname << "\n";
-            }
-
-            // Connect with correct handshake
-            auto ws = connect_wss(ioc, sslctx, tcp_host, port, target, sni_hostname, handshake_headers);
-
-            // send subscribe (as text frame)
-            ws.text(true);
-            ws.write(asio::buffer(subscribe_json));
-
-            if (label == "KX") {
-                if (!snapshot_json.empty()) {
-                    ws.write(asio::buffer(snapshot_json));
-                }
-                if (!alt_subscribe_json.empty()) {
-                    ws.write(asio::buffer(alt_subscribe_json));
-                    std::lock_guard lk(out_mtx);
-                    std::cerr << "[KX] Sent alternate subscribe (namespaced channel) immediately\n";
-                }
-            }
-            bool tried_alt_sub = true; // since we already sent it
-            int unmatched_count = 0;
-
-            {
-                std::lock_guard lk(out_mtx);
-                std::cout << "["<<label<<"] connected and subscribed";
-                if (label == "KX" && !snapshot_json.empty()) {
-                    std::cout << " (+ snapshot requested)";
-                }
-                std::cout << "\n";
-            }
-
-            // Add keep-alive pinger to prevent idle timeouts
-            std::atomic<bool> ws_alive{true};
-            std::thread pinger([&ws, &stop_flag, &ws_alive, label, verbose](){
-                while(!stop_flag.load() && ws_alive.load()) {
-                    std::this_thread::sleep_for(std::chrono::seconds(20));
-                    beast::error_code ec;
-                    if (label == "PM") {
-                        ws.text(true);
-                        ws.write(asio::buffer(std::string("PING")), ec);
-                    } else {
-                        ws.ping(websocket::ping_data{}, ec);
-                    }
-                    if (ec) {
-                        if (verbose) {
-                            std::lock_guard lk(out_mtx);
-                            std::cerr << "["<<label<<"] ping error: " << ec.message() << std::endl;
-                        }
-                        break;
-                    }
-                }
-            });
-
-            beast::flat_buffer buffer;
-
-            // Kalshi orderbook for delta maintenance (KX only)
-            KalshiBook kx_book;
-
-            for (;;) {
-                beast::error_code ec;
-                ws.read(buffer, ec);
-                if (ec) {
-                    if (verbose) {
-                        std::lock_guard lk(out_mtx);
-                        std::cerr << "["<<label<<"] read error: " << ec.message() << std::endl;
-                    }
-                    break;
-                }
-                auto data = beast::buffers_to_string(buffer.data());
-                buffer.consume(buffer.size());
-
-                // parse JSON and update quotes
-                try {
-                    auto j = json::parse(data);
-                    // Kalshi wraps payload in j["msg"] or j["data"], extract if present
-                    const json* payload = &j;
-                    if (j.contains("msg") && j["msg"].is_object()) {
-                        payload = &j["msg"];
-                    } else if (j.contains("data") && j["data"].is_object()) {
-                        payload = &j["data"];
-                    }
-
-                    // KX: use KalshiBook for snapshots and deltas, OR direct fields for categorical
-                    if (label == "KX") {
-                        // Fast-path: Kalshi wraps snapshots in {"orderbook":{...}}
-                        if (payload->contains("orderbook") && (*payload)["orderbook"].is_object()) {
-                            const auto& ob = (*payload)["orderbook"];
-                            double bid = 0, ask = 0;
-                            // Reuse nested extractor that handles bids_dollars/asks_dollars/etc.
-                            if (extract_bbo_from_nested(ob, bid, ask)) {
-                                qb.set_bbo(bid, ask);
-                                unmatched_count = 0;
-                                if (verbose) {
-                                    std::lock_guard lk(out_mtx);
-                                    std::cout << "[KX] Orderbook snapshot: bid=" << bid << " ask=" << ask << "\n";
-                                }
-                                continue;
-                            }
-                        }
-
-                        // Try direct best_bid/best_ask first (categorical contracts, or simpler feeds)
-                        double direct_bid = kx_getBid(*payload);
-                        double direct_ask = kx_getAsk(*payload);
-
-                        if (!std::isnan(direct_bid) && !std::isnan(direct_ask)) {
-                            // Direct quotes available (categorical contract or simple binary)
-                            qb.set_bbo(direct_bid, direct_ask);
-                            unmatched_count = 0;
-                            if (verbose) {
-                                std::lock_guard lk(out_mtx);
-                                std::cout << "[KX] Direct quotes: bid=" << direct_bid << " ask=" << direct_ask << "\n";
-                            }
-                            continue;
-                        }
-
-                        // Fallback: Handle binary YES/NO snapshot (initialize book)
-                        if (payload->contains("yes") || payload->contains("yes_dollars") ||
-                            payload->contains("no") || payload->contains("no_dollars")) {
-                            kx_book.apply_snapshot(*payload);
-                            auto [bb, ba] = kx_book.bbo_yes();
-                            if (bb && ba) {
-                                qb.set_bbo(*bb, *ba);
-                                unmatched_count = 0;
-                            } else {
-                                if (bb) qb.set_bid(*bb);
-                                if (ba) qb.set_ask(*ba);
-                            }
-                            if (verbose) {
-                                std::lock_guard lk(out_mtx);
-                                std::cout << "[KX] Loaded snapshot: YES bid=" << (bb ? std::to_string(*bb) : "NA")
-                                          << " ask=" << (ba ? std::to_string(*ba) : "NA") << "\n";
-                            }
-                            continue;
-                        }
-
-                        // Handle delta update (now supports Kalshi's book_side/quantity_delta format)
-                        if (payload->contains("delta") || payload->contains("quantity_delta") ||
-                            payload->contains("book_side") || payload->contains("side")) {
-                            kx_book.apply_delta(*payload);
-                            auto [bb, ba] = kx_book.bbo_yes();
-                            if (bb && ba) {
-                                qb.set_bbo(*bb, *ba);
-                                unmatched_count = 0;
-                                if (verbose) {
-                                    std::lock_guard lk(out_mtx);
-                                    std::cout << "[KX] Delta applied: bid=" << *bb << " ask=" << *ba << "\n";
-                                }
-                            } else {
-                                if (bb) qb.set_bid(*bb);
-                                if (ba) qb.set_ask(*ba);
-                            }
-                            continue;
-                        }
-
-                        // If nothing matched, log for debugging
-                        if (verbose) {
-                            unmatched_count++;
-                            if (unmatched_count <= 5) {  // Only show first few
-                                std::lock_guard lk(out_mtx);
-                                std::string s = payload->dump();
-                                if (s.size() > 800) s.resize(800), s += "...";
-                                std::cout << "[TRACE][KX] unmatched payload #" << unmatched_count << ": " << s << "\n";
-                            }
-                        }
-                    }
-
-                    // PM or fallback: use generic extractors
-                    auto bb = extract_best_bid(*payload);
-                    auto ba = extract_best_ask(*payload);
-                    if (bb && ba) {
-                        qb.set_bbo(*bb, *ba);
-                        if (label == "KX") unmatched_count = 0; // reset on success
-                    } else {
-                        if (bb) qb.set_bid(*bb);
-                        if (ba) qb.set_ask(*ba);
-
-                        // Rate-limited debug logging (not just first message)
-                        static auto last_dump = std::chrono::steady_clock::now();
-                        auto now_dump = std::chrono::steady_clock::now();
-                        if (now_dump - last_dump > std::chrono::seconds(2)) {
-                            last_dump = now_dump;
-                            std::lock_guard lk(out_mtx);
-                            std::string s = payload->dump();
-                            if (s.size() > 1500) s.resize(1500), s += "...";
-                            std::cout << "[DEBUG]["<<label<<"] unmatched payload: " << s << "\n";
-                        }
-
-                        // Kalshi: try alternate subscription if initial format not working
-                        if (label == "KX" && !(bb || ba)) {
-                            unmatched_count++;
-                            if (!tried_alt_sub && unmatched_count >= 5 && !alt_subscribe_json.empty()) {
-                                tried_alt_sub = true;
-                                ws.text(true);
-                                ws.write(asio::buffer(alt_subscribe_json));
-                                std::lock_guard lk(out_mtx);
-                                std::cerr << "[KX] Sent alternate subscribe (namespaced channel)\n";
-                            }
-                        }
-                    }
-
-                    if (verbose) {
-                        std::lock_guard lk(out_mtx);
-                        std::cout << "["<<label<<"] got message: " << data << std::endl;
-                    }
-                } catch (...) {
-                    // ignore non-json
-                }
-            }
-
-            // Stop pinger and close ws cleanly before thread joins
-            ws_alive.store(false);
-            beast::error_code ignore;
-            ws.close(websocket::close_code::normal, ignore);
-            if (pinger.joinable()) pinger.join();
-
-        } catch (const std::exception &e) {
-            if (verbose) {
-                std::lock_guard lk(out_mtx);
-                std::cerr << "["<<label<<"] exception: " << e.what() << std::endl;
-            }
-        }
-
-        if (stop_flag.load()) break;
-        int backoff_ms = std::min(5000, 250 * std::max(1, ++attempt));
-        if (verbose) {
-            std::lock_guard lk(out_mtx);
-            std::cerr << "["<<label<<"] reconnecting in " << backoff_ms << "ms\n";
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
-    }
-}
-
-// ----- small arbitrage detector thread -----
-void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
-                    int pm_fee_bps, int kx_fee_bps, int min_edge_bps,
-                    std::atomic<bool> &stop_flag,
-                    int stale_ms, int max_skew_ms, int ping_ms,
-                    const std::string& windows_csv) {
-    using clock = std::chrono::steady_clock;
-    auto now_ms = []{ return std::chrono::time_point_cast<std::chrono::milliseconds>(clock::now()); };
-
-    auto safe_mid = [](std::optional<double> b, std::optional<double> a)->std::optional<double>{
-        if (!b || !a) return std::nullopt;
-        return 0.5 * (*b + *a);
-    };
-    auto clamp01 = [](double x){ return std::max(0.0, std::min(1.0, x)); };
-
-    // optional CSV
-    std::unique_ptr<std::ofstream> csv;
-    if (!windows_csv.empty()) {
-        csv = std::make_unique<std::ofstream>(windows_csv, std::ios::app);
-        if (csv && csv->tellp() == 0) {
-            *csv << "opened_ms,closed_ms,duration_ms,leg,"
-                 << "sell_bid,buy_ask,raw,bps_capital,bps_buy,max_edge_bps,qualified\n";
-        }
-    }
-
-    struct Window {
-        bool open = false;
-        std::string leg;     // "PM->KX" or "KX->PM"
-        clock::time_point opened;
-        double max_edge_bps = -1e9;
-        // for last snapshot detail
-        double last_sell_bid=0, last_buy_ask=0, last_raw=0, last_bps_cap=0, last_bps_buy=0;
-    } win;
-
-    // spam reduction
-    static double last_pm_bid = -1, last_pm_ask = -1;
-    static double last_kx_bid = -1, last_kx_ask = -1;
-
-    while(!stop_flag.load()) {
-        auto pm = pm_q.snap();
-        auto kx = kx_q.snap();
-        auto now = clock::now();
-
-        // Heartbeat to show what's missing
-        static auto last_hb = clock::now();
-        if (clock::now() - last_hb > std::chrono::seconds(2)) {
-            last_hb = clock::now();
-            std::lock_guard lk(out_mtx);
-            std::cout << "[HEARTBEAT] pm_bid=" << (pm.bid ? std::to_string(*pm.bid) : "NA")
-                      << " pm_ask=" << (pm.ask ? std::to_string(*pm.ask) : "NA")
-                      << " kx_bid=" << (kx.bid ? std::to_string(*kx.bid) : "NA")
-                      << " kx_ask=" << (kx.ask ? std::to_string(*kx.ask) : "NA")
-                      << " age_ms pm=" << std::chrono::duration_cast<std::chrono::milliseconds>(clock::now()-pm.ts).count()
-                      << " kx=" << std::chrono::duration_cast<std::chrono::milliseconds>(clock::now()-kx.ts).count()
-                      << "\n";
-        }
-
-        // Freshness checks
-        auto age_ms = [&](clock::time_point ts){
-            return (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - ts).count();
-        };
-        int pm_age = age_ms(pm.ts), kx_age = age_ms(kx.ts);
-        bool pm_fresh = pm_age <= stale_ms;
-        bool kx_fresh = kx_age <= stale_ms;
-        bool skew_ok  = std::abs(pm_age - kx_age) <= max_skew_ms;
-
-        // Decide if we even try an arb this tick
-        bool have_books = (pm.bid && pm.ask && kx.bid && kx.ask);
-        if (!have_books || !(pm_fresh && kx_fresh && skew_ok)) {
-            // if a window was open, close it (expired)
-            if (win.open) {
-                auto dur_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - win.opened).count();
-                bool qualified = dur_ms >= ping_ms;
-                {
-                    std::lock_guard lk(out_mtx);
-                    std::cout << "[ARB-CLOSE] leg="<<win.leg<<" duration_ms="<<dur_ms
-                              << " max_edge_bps="<<win.max_edge_bps
-                              << " qualified="<<(qualified?"yes":"no")
-                              << " (stale/skew)\n";
-                }
-                if (csv) {
-                    auto opened_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(win.opened).time_since_epoch().count();
-                    auto closed_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
-                    *csv << opened_ms << "," << closed_ms << "," << dur_ms << "," << win.leg << ","
-                         << win.last_sell_bid << "," << win.last_buy_ask << ","
-                         << win.last_raw << "," << win.last_bps_cap << "," << win.last_bps_buy << ","
-                         << win.max_edge_bps << "," << (qualified?1:0) << "\n";
-                }
-                win = Window{};
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-
-        // Potential complement flip on KX (so both represent YES on the same team)
-        auto pm_mid = safe_mid(pm.bid, pm.ask);
-        auto kx_mid = safe_mid(kx.bid, kx.ask);
-        bool flipped_kx = false;
-        if (pm_mid && kx_mid && std::abs((*pm_mid + *kx_mid) - 1.0) < 0.10) {
-            // flip KX YES book into the complement YES
-            auto old_kx_bid = kx.bid;
-            auto old_kx_ask = kx.ask;
-            if (old_kx_ask) kx.bid = clamp01(1.0 - *old_kx_ask);
-            else            kx.bid.reset();
-            if (old_kx_bid) kx.ask = clamp01(1.0 - *old_kx_bid);
-            else            kx.ask.reset();
-            flipped_kx = true;
-        }
-
-        // Re-check we have usable prices
-        if (!(pm.bid && pm.ask && kx.bid && kx.ask)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-
-        // Spam reduction on displayed BBO (every 2s)
-        static auto last_bbo = clock::now();
-        if (clock::now() - last_bbo > std::chrono::seconds(2)) {
-            last_bbo = clock::now();
-            std::lock_guard lk(out_mtx);
-            std::cout << "[BBO] PM " << *pm.bid << "/" << *pm.ask
-                      << " | KX" << (flipped_kx?"(flipped)":"") << " "
-                      << *kx.bid << "/" << *kx.ask
-                      << " | age_ms pm="<<pm_age<<" kx="<<kx_age<<"\n";
-        }
-
-        // Edge calculators (net of fees)
-        auto pm_sell_kx_buy = [&](){
-            double sell_bid = *pm.bid;
-            double buy_ask  = *kx.ask;
-            double sell_net = sell_bid * (1.0 - pm_fee_bps/10000.0);
-            double buy_gross= buy_ask  * (1.0 + kx_fee_bps/10000.0);
-            double raw      = sell_net - buy_gross;              // $/contract, net of fees
-            double cap      = (1.0 - sell_bid) + buy_ask;        // $ capital tied
-            double bps_cap  = (cap>0? raw/cap : 0.0) * 10000.0;
-            double bps_buy  = (buy_ask>0? raw/buy_ask : 0.0) * 10000.0;
-            return std::make_tuple(std::string("PM->KX"), sell_bid, buy_ask, raw, bps_cap, bps_buy);
-        };
-
-        auto kx_sell_pm_buy = [&](){
-            double sell_bid = *kx.bid;
-            double buy_ask  = *pm.ask;
-            double sell_net = sell_bid * (1.0 - kx_fee_bps/10000.0);
-            double buy_gross= buy_ask  * (1.0 + pm_fee_bps/10000.0);
-            double raw      = sell_net - buy_gross;
-            double cap      = (1.0 - sell_bid) + buy_ask;
-            double bps_cap  = (cap>0? raw/cap : 0.0) * 10000.0;
-            double bps_buy  = (buy_ask>0? raw/buy_ask : 0.0) * 10000.0;
-            return std::make_tuple(std::string("KX->PM"), sell_bid, buy_ask, raw, bps_cap, bps_buy);
-        };
-
-        auto L1 = pm_sell_kx_buy();
-        auto L2 = kx_sell_pm_buy();
-
-        auto better = (std::get<4>(L1) > std::get<4>(L2)) ? L1 : L2; // compare bps_capital
-        auto [leg, sell_bid, buy_ask, raw, bps_cap, bps_buy] = better;
-
-        // Open/maintain/close window
-        bool edge_ok = (bps_cap >= min_edge_bps);
-        if (edge_ok) {
-            if (!win.open) {
-                win.open = true;
-                win.leg = leg;
-                win.opened = now;
-                win.max_edge_bps = bps_cap;
-                win.last_sell_bid=sell_bid; win.last_buy_ask=buy_ask;
-                win.last_raw=raw; win.last_bps_cap=bps_cap; win.last_bps_buy=bps_buy;
-                std::lock_guard lk(out_mtx);
-                std::cout << "[ARB-OPEN] leg="<<leg<<" sell@"<<sell_bid<<" buy@"<<buy_ask
-                          <<" raw=$"<<std::fixed<<std::setprecision(4)<<raw
-                          <<" bps_capital="<<std::setprecision(1)<<bps_cap
-                          <<" bps_buy="<<std::setprecision(1)<<bps_buy
-                          << (flipped_kx?" (KX flipped)":"") << "\n";
-            } else {
-                // update max edge seen
-                if (bps_cap > win.max_edge_bps) win.max_edge_bps = bps_cap;
-                win.last_sell_bid=sell_bid; win.last_buy_ask=buy_ask;
-                win.last_raw=raw; win.last_bps_cap=bps_cap; win.last_bps_buy=bps_buy;
-            }
-        } else if (win.open) {
-            // close and report
-            auto dur_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - win.opened).count();
-            bool qualified = dur_ms >= ping_ms;
-            {
-                std::lock_guard lk(out_mtx);
-                std::cout << "[ARB-CLOSE] leg="<<win.leg<<" duration_ms="<<dur_ms
-                          << " max_edge_bps="<<win.max_edge_bps
-                          << " qualified="<<(qualified?"yes":"no") << "\n";
-            }
-            if (csv) {
-                auto opened_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(win.opened).time_since_epoch().count();
-                auto closed_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
-                *csv << opened_ms << "," << closed_ms << "," << dur_ms << "," << win.leg << ","
-                     << win.last_sell_bid << "," << win.last_buy_ask << ","
-                     << win.last_raw << "," << win.last_bps_cap << "," << win.last_bps_buy << ","
-                     << win.max_edge_bps << "," << (qualified?1:0) << "\n";
-            }
-            win = Window{};
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(75));
-    }
-}
-
-// ----- Kalshi ticker pattern recognition -----
-static bool is_kalshi_event_ticker(const std::string& t) {
-    // Pattern: KX[A-Z]+GAME-DDMMMDDTEAMTEAM
-    // e.g., KXNBAGAME-25NOV10MILDAL, KXNHLGAME-25NOV12NJCHI
-    std::regex ev_re(R"(^KX[A-Z]+GAME-\d{2}[A-Z]{3}\d{2}[A-Z]{4,12}$)");
-    return std::regex_match(t, ev_re);
-}
-
-static bool is_kalshi_market_ticker(const std::string& t) {
-    // Pattern: ends with team code, TOTAL, SPREAD, ML, etc.
-    // e.g., KXNBAGAME-...-MIL, KXNBAGAME-...-TOTAL-O231_5, KXNBAGAME-...-SPREAD-MIL-2_5
-    std::regex mrk_re(R"(^KX[A-Z]+GAME-.*-(MIL|DAL|NYR|NJ|CHI|PHI|ATL|BOS|LAC|LAL|GSW|TOTAL-.+|SPREAD-.+|ML|WINNER|MONEYLINE)$)");
-    return std::regex_match(t, mrk_re);
-}
-
 // ----- main & CLI parsing (simple) -----
 int main(int argc, char **argv) {
     // VERY minimal arg parsing -- adapt as needed
     std::string csv = "live_matches.csv";
     int row = 1;
-    std::string pm_ws = "wss://clob.polymarket.com/ws";
+    std::string pm_ws = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
     std::string kx_ws = "wss://api.elections.kalshi.com/trade-api/ws/v2";
-    // Subscribe ONLY to YES to avoid YES/NO intermixing.
-    // If you want NO, run a second process for the NO token rather than mixing.
-    std::string pm_sub = R"({"type":"market","assets_ids":["{PM_YES_TOKEN}"]})";
-    // Kalshi market_orderbook channel (includes snapshot + deltas)
-    std::string kx_sub = R"({"id":1,"cmd":"subscribe","params":{"channels":["market_orderbook"],"market_ticker":"{KALSHI_TICKER}","depth":5,"dollars":true}})";
-    // Namespaced variant also works on some deployments
-    std::string kx_sub_alt = R"({"id":2,"cmd":"subscribe","params":{"channels":["market_orderbook:{KALSHI_TICKER}"],"depth":5,"dollars":true}})";
-    // Explicit snapshot request as belt-and-suspenders
-    std::string kx_snapshot = R"({"id":3,"cmd":"get_market_orderbook","params":{"market_ticker":"{KALSHI_TICKER}","depth":5,"dollars":true}})";
+    // Use Polymarket token-based orderbook subscribe (channels form often accepted)
+    std::string pm_sub_template = R"({"type":"subscribe","channels":["orderbook"],"token_id":"{PM_YES_TOKEN}"})";
+    std::string pm_sub;
+    // Kalshi orderbook_delta channel (sends snapshot + deltas for a single market)
+    std::string kx_sub = R"({
+      "id": 1,
+      "cmd": "subscribe",
+      "params": {
+        "channels": ["orderbook_delta"],
+        "market_ticker": "{KALSHI_TICKER}",
+        "depth": 5,
+        "dollars": true
+      }
+    })";
+    // No alternate subscription or explicit snapshot
+    std::string kx_sub_alt = "";
+    std::string kx_snapshot = "";
     int pm_fee_bps = 200;
     int kx_fee_bps = 100;
     int min_edge_bps = 1;
-    int stale_ms = 60000;    // venue quote considered stale beyond this age (60s for low-volume markets)
-    int max_skew_ms = 30000; // max allowed ts difference between venues (30s)
-    int ping_ms = 200;       // your end-to-end order RTT budget
-    std::string windows_csv; // optional CSV for window logs
+    int stale_ms = 60000;
+    int max_skew_ms = 30000;
+    int ping_ms = 200;
+    std::string windows_csv;
     std::string kalshi_key;
     std::string kalshi_secret_path;
-    std::string kalshi_host_override;  // e.g. "104.18.XX.XX" to bypass DNS
-    std::string kalshi_sni_host = "api.elections.kalshi.com";  // SNI hostname for TLS (match WS endpoint)
+    std::string kalshi_host_override;
+    std::string kalshi_sni_host = "api.elections.kalshi.com";
+    bool global_verbose = false;
 
     for (int i=1;i<argc;i++) {
         std::string a = argv[i];
@@ -1720,6 +871,7 @@ int main(int argc, char **argv) {
         else if (a=="--kalshi-secret-path" && i+1<argc) kalshi_secret_path = argv[++i];
         else if (a=="--kalshi-host-override" && i+1<argc) kalshi_host_override = argv[++i];
         else if (a=="--kalshi-sni-host" && i+1<argc) kalshi_sni_host = argv[++i];
+        else if (a=="--verbose") global_verbose = true;
     }
 
     // Read Kalshi private key (PEM) from --kalshi-secret-path
@@ -1787,7 +939,11 @@ int main(int argc, char **argv) {
         if (tokens_opt) {
             pm_yes_token = tokens_opt->yes_token;
             pm_no_token = tokens_opt->no_token;
+            if (!tokens_opt->market_hex.empty()) {
+                g_pm_market_hex = tokens_opt->market_hex;
+            }
             std::cout << "[PM] Hydrated tokens: yes=" << pm_yes_token << ", no=" << pm_no_token << "\n";
+            if (!g_pm_market_hex.empty()) std::cout << "[PM] Market hex: "<< g_pm_market_hex <<"\n";
         } else {
             std::cerr << "[PM] WARNING: Failed to fetch tokens for market " << pm_market_id << std::endl;
         }
@@ -1796,6 +952,10 @@ int main(int argc, char **argv) {
     if (pm_yes_token.empty()) {
         std::cerr << "[PM] No YES token; relying on market subscription payloads only.\n";
     }
+
+    // Expose hydrated tokens globally for the PM WS parser
+    if (!pm_yes_token.empty()) g_pm_yes_token = pm_yes_token;
+    if (!pm_no_token.empty())  g_pm_no_token  = pm_no_token;
 
     // Hydrate and normalize Kalshi market (handles categorical O/U, ticker variations)
     std::string kx_subscribe_ticker;  // Actual ticker to subscribe to (may be contract ticker)
@@ -1880,21 +1040,25 @@ int main(int argc, char **argv) {
         }
         return s;
     };
-    pm_sub = replace_all(pm_sub, "{PM_YES_TOKEN}", pm_yes_token);
-    pm_sub = replace_all(pm_sub, "{PM_NO_TOKEN}", pm_no_token);
-    pm_sub = replace_all(pm_sub, "{PM_MARKET_ID}", pm_market_id);
-    // Support both {KALSHI_TICKER} (new) and {KALSHI_EVENT} (old) placeholders
-    kx_sub = replace_all(kx_sub, "{KALSHI_TICKER}", kx_ticker);
-    kx_sub = replace_all(kx_sub, "{KALSHI_EVENT}", kx_ticker);
-    kx_sub_alt = replace_all(kx_sub_alt, "{KALSHI_TICKER}", kx_ticker);
-    kx_sub_alt = replace_all(kx_sub_alt, "{KALSHI_EVENT}", kx_ticker);
-    kx_snapshot = replace_all(kx_snapshot, "{KALSHI_TICKER}", kx_ticker);
-    kx_snapshot = replace_all(kx_snapshot, "{KALSHI_EVENT}", kx_ticker);
+    // Build Polymarket subscribe messages using the current MARKET channel format.
+    std::string pm_sub_alt = "";
+    std::vector<std::string> pm_subs;
+    if (!pm_yes_token.empty()) {
+        // Subscribe to the YES token using assets_ids + type="market"
+        pm_subs.push_back(std::string(R"({"assets_ids":[")") + pm_yes_token + R"("],"type":"market"})");
+    }
+    // Optional: also subscribe by condition_id (market/question hex) if desired
+    if (!g_pm_market_hex.empty()) {
+        pm_subs.push_back(std::string(R"({"condition_ids":[")") + g_pm_market_hex + R"("],"type":"market"})");
+    }
+    if (pm_subs.empty()) {
+        std::cerr << "[PM] WARNING: No valid subscribe JSON generated; relying on REST fallback.\n";
+    }
 
     // Warn if PM tokens are missing (but market L2 feed may work anyway)
     if (pm_yes_token.empty() || pm_no_token.empty()) {
         std::cerr << "[PM] WARNING: Missing token ids for market "
-                  << pm_market_id << ". Market L2 feed should still work.\n";
+                  << pm_market_id << ". Market L2 feed should still work." << std::endl;
     }
 
     // Log Kalshi auth status
@@ -1910,18 +1074,22 @@ int main(int argc, char **argv) {
     std::atomic<bool> stop_flag{false};
 
     // Seed initial Kalshi quotes from REST snapshot (avoids sitting on NAs waiting for first delta)
-    if (!kx_subscribe_ticker.empty() && !kalshi_key.empty() && kalshi_pkey) {
-        auto snapshot = fetch_kx_orderbook_snapshot(kx_subscribe_ticker, kalshi_key, kalshi_pkey);
+    // Try to seed from the best candidate: prefer normalized subscribe ticker, fall back to raw CSV ticker
+    const std::string snapshot_ticker = !kx_subscribe_ticker.empty() ? kx_subscribe_ticker : kx_ticker;
+    if (!snapshot_ticker.empty() && !kalshi_key.empty() && kalshi_pkey) {
+        auto snapshot = fetch_kx_orderbook_snapshot(snapshot_ticker, kalshi_key, kalshi_pkey);
         if (snapshot) {
             kx_q.set_bbo(snapshot->first, snapshot->second);
             std::cout << "[KX] Seeded from snapshot: bid=" << snapshot->first
-                      << " ask=" << snapshot->second << "\n";
+                      << " ask=" << snapshot->second << " (ticker="<<snapshot_ticker<<")\n";
+        } else {
+            std::cerr << "[KX] No snapshot data available for ticker="<<snapshot_ticker<<"\n";
         }
     }
 
-    // Polymarket: no special headers
+    // Polymarket: include Origin header (some gateways expect this) and a User-Agent via decorator
     auto pm_header_supplier = []() {
-        return std::vector<std::pair<std::string,std::string>>{};
+        return std::vector<std::pair<std::string,std::string>>{{"Origin","https://polymarket.com"}};
     };
 
     // Kalshi: regenerate RSA-PSS headers every connect (fresh timestamp/signature)
@@ -1935,16 +1103,67 @@ int main(int argc, char **argv) {
         return h;
     };
 
+    // Finalize KX subscribe JSON with the resolved ticker (defensive: ensure placeholder replaced)
+    kx_sub = replace_all(kx_sub, "{KALSHI_TICKER}", kx_ticker);
+    kx_sub = replace_all(kx_sub, "{KALSHI_EVENT}", kx_ticker);
+    kx_sub_alt = replace_all(kx_sub_alt, "{KALSHI_TICKER}", kx_ticker);
+    kx_sub_alt = replace_all(kx_sub_alt, "{KALSHI_EVENT}", kx_ticker);
+    kx_snapshot = replace_all(kx_snapshot, "{KALSHI_TICKER}", kx_ticker);
+
+    // Debug: print the final subscribe JSONs so we can see exactly what's being sent
+    {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[DEBUG] pm_sub='"<< pm_sub <<"' pm_sub_alt='"<< pm_sub_alt <<"' kx_sub='"<< kx_sub <<"' kx_sub_alt='"<< kx_sub_alt <<"'\n";
+    }
+
+    // Debug: print all PM subscribe candidates
+    if (!pm_subs.empty()) {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[DEBUG] PM subscribe candidates (count=" << pm_subs.size() << "):\n";
+        for (size_t i=0;i<pm_subs.size();++i) {
+            std::cerr << "  ["<<i<<"] " << pm_subs[i] << "\n";
+        }
+    }
+
     // start threads
     std::thread t_pm([&](){
-        run_ws_watch(pm_ws, pm_header_supplier, pm_sub, "", "", pm_q, "PM", stop_flag, /*verbose=*/false);
+        run_ws_watch(pm_ws, pm_header_supplier, pm_subs, pm_sub_alt, "", pm_q,
+                     "PM", stop_flag, /*verbose=*/global_verbose,
+                     /*host_override=*/"", /*sni_host_override=*/"");
     });
+
+    // PM REST poller: if WS isn't delivering price_changes (EOFs), keep a periodic REST fallback to populate pm_q
+    std::thread t_pm_rest([&](){
+        // Polling interval: 1000ms (1s)
+        const std::chrono::milliseconds poll_interval(1000);
+        while (!stop_flag.load()) {
+            try {
+                if (!g_pm_yes_token.empty()) {
+                    auto fb = fetch_pm_clob_book(g_pm_yes_token);
+                    if (fb.best_bid && fb.best_ask) {
+                        pm_q.set_bbo(*fb.best_bid, *fb.best_ask);
+                        if (global_verbose) {
+                            std::lock_guard lk(out_mtx);
+                            std::cerr << "[PM-POLLER] REST applied: bb="<<*fb.best_bid<<" ba="<<*fb.best_ask<<"\n";
+                        }
+                    }
+                } else {
+                    // If no token but we do have a market hex, try polling via market id (not implemented) - skip
+                }
+            } catch (const std::exception &e) {
+                std::lock_guard lk(out_mtx);
+                std::cerr << "[PM-POLLER] error: "<<e.what()<<"\n";
+            }
+            std::this_thread::sleep_for(poll_interval);
+        }
+    });
+
     std::thread t_kx([&](){
-        run_ws_watch(kx_ws, kx_header_supplier, kx_sub, kx_sub_alt, kx_snapshot, kx_q, "KX", stop_flag, /*verbose=*/true, kalshi_host_override, kalshi_sni_host);
+        run_ws_watch(kx_ws, kx_header_supplier, {kx_sub}, kx_sub_alt, kx_snapshot, kx_q, "KX", stop_flag, /*verbose=*/global_verbose, kalshi_host_override, kalshi_sni_host);
     });
     std::thread t_arb([&](){
         arbitrage_loop(pm_q, kx_q, pm_fee_bps, kx_fee_bps, min_edge_bps, stop_flag,
-                       stale_ms, max_skew_ms, ping_ms, windows_csv);
+                       stale_ms, max_skew_ms, ping_ms, windows_csv, global_verbose);
     });
 
     // ctrl-c handling: simple wait for Enter to quit
@@ -1953,9 +1172,687 @@ int main(int argc, char **argv) {
     stop_flag.store(true);
 
     t_pm.join();
+    t_pm_rest.join();
     t_kx.join();
     t_arb.join();
 
     std::cout << "Stopped cleanly\n";
     return 0;
 }
+
+// Restore hydrate_and_normalize_kx_market (categorical contract selection and REST hydration)
+std::optional<KalshiMarketInfo> hydrate_and_normalize_kx_market(
+    const std::string& raw_ticker,
+    const std::string& key_id,
+    EVP_PKEY* pkey)
+{
+    if (raw_ticker.empty() || key_id.empty() || !pkey) return std::nullopt;
+    try {
+        // fetch market by ticker from Kalshi REST
+        auto fetch_market = [&](const std::string& ticker) -> std::optional<json> {
+            asio::io_context ioc;
+            ssl::context sslctx(ssl::context::tlsv12_client);
+            sslctx.set_default_verify_paths();
+            const std::string host = "api.elections.kalshi.com";
+            tcp::resolver resolver{ioc};
+            auto results = resolver.resolve(host, "443");
+            beast::tcp_stream tcp_stream{ioc};
+            tcp_stream.connect(results);
+            beast::ssl_stream<beast::tcp_stream> tls_stream{std::move(tcp_stream), sslctx};
+            if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str())) return std::nullopt;
+            beast::get_lowest_layer(tls_stream).expires_after(std::chrono::seconds(30));
+            tls_stream.handshake(ssl::stream_base::client);
+            std::string path = "/trade-api/v2/markets?ticker=" + ticker;
+            auto headers = make_kalshi_auth_headers(key_id, pkey, path);
+            http::request<http::string_body> req{http::verb::get, path, 11};
+            req.set(http::field::host, host);
+            req.set(http::field::user_agent, "arb-ws-watcher/1.0");
+            for (auto& h : headers) req.set(h.first, h.second);
+            http::write(tls_stream, req);
+            beast::flat_buffer buffer;
+            http::response<http::string_body> res;
+            http::read(tls_stream, buffer, res);
+            if (res.result() != http::status::ok) return std::nullopt;
+            return json::parse(res.body());
+        };
+
+        std::vector<std::string> candidates = {raw_ticker};
+        json market_data; std::string found_ticker;
+        for (const auto& candidate : candidates) {
+            auto resp = fetch_market(candidate);
+            if (resp && resp->is_object() && resp->contains("markets")) {
+                auto& markets = (*resp)["markets"];
+                if (markets.is_array() && !markets.empty()) {
+                    for (const auto& m : markets) {
+                        if (m.is_object() && m.value("ticker", "") == candidate) {
+                            market_data = m;
+                            found_ticker = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!market_data.empty()) break;
+        }
+        if (market_data.empty()) return std::nullopt;
+
+        KalshiMarketInfo info;
+        info.market_type = market_data.value("market_type", "");
+        if (info.market_type == "categorical") {
+            bool want_over = (raw_ticker.find("-O") != std::string::npos || raw_ticker.find("OVER") != std::string::npos);
+            bool want_under = (raw_ticker.find("-U") != std::string::npos || raw_ticker.find("UNDER") != std::string::npos);
+            if (!market_data.contains("contracts") || !market_data["contracts"].is_array()) return std::nullopt;
+            for (const auto& contract : market_data["contracts"]) {
+                std::string code = contract.value("code", "");
+                std::string display = contract.value("display", "");
+                bool is_over = (code == "O" || code == "OVER" || display == "Over");
+                bool is_under = (code == "U" || code == "UNDER" || display == "Under");
+                if ((want_over && is_over) || (want_under && is_under) || (!want_over && !want_under && is_over)) {
+                    info.subscribe_ticker = contract.value("ticker", "");
+                    info.contract_code = code;
+                    break;
+                }
+            }
+            if (info.subscribe_ticker.empty()) return std::nullopt;
+        } else {
+            info.subscribe_ticker = found_ticker;
+            info.contract_code = "YES";
+        }
+        return info;
+    } catch (const std::exception& e) {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[KX] Market hydration failed: " << e.what() << "\n";
+    }
+    return std::nullopt;
+}
+
+// Snapshot fetcher used to seed quotes
+std::optional<std::pair<double,double>> fetch_kx_orderbook_snapshot(
+    const std::string& ticker,
+    const std::string& key_id,
+    EVP_PKEY* pkey)
+{
+    if (ticker.empty() || key_id.empty() || !pkey) return std::nullopt;
+    try {
+        asio::io_context ioc;
+        ssl::context sslctx(ssl::context::tlsv12_client);
+        sslctx.set_default_verify_paths();
+        const std::string host = "api.elections.kalshi.com";
+        tcp::resolver resolver{ioc};
+        auto results = resolver.resolve(host, "443");
+        beast::tcp_stream tcp_stream{ioc};
+        tcp_stream.connect(results);
+        beast::ssl_stream<beast::tcp_stream> tls_stream{std::move(tcp_stream), sslctx};
+        if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str())) return std::nullopt;
+        beast::get_lowest_layer(tls_stream).expires_after(std::chrono::seconds(30));
+        tls_stream.handshake(ssl::stream_base::client);
+        const std::string path = "/trade-api/v2/market_orderbook?market_ticker=" + ticker;
+        auto headers = make_kalshi_auth_headers(key_id, pkey, path);
+        http::request<http::string_body> req{http::verb::get, path, 11};
+        req.set(http::field::host, host);
+        req.set(http::field::user_agent, "arb-ws-watcher/1.0");
+        for (auto& h : headers) req.set(h.first, h.second);
+        http::write(tls_stream, req);
+        beast::flat_buffer buffer;
+        http::response<http::string_body> res;
+        http::read(tls_stream, buffer, res);
+        if (res.result() != http::status::ok) {
+            std::lock_guard lk(out_mtx);
+            std::cerr << "[KX] Snapshot HTTP " << static_cast<unsigned>(res.result())
+                      << " path="<< path << " body=" << res.body() << "\n";
+            return std::nullopt;
+        }
+        auto j = json::parse(res.body());
+        const json* payload = &j;
+        if (j.is_object() && j.contains("orderbook") && j["orderbook"].is_object()) payload = &j["orderbook"];
+        double bid=0, ask=0;
+        if (extract_bbo_from_nested(*payload, bid, ask)) return std::make_pair(bid, ask);
+        if (payload->contains("best_bid") && (*payload)["best_bid"].is_number()) bid = (*payload)["best_bid"].get<double>();
+        if (payload->contains("best_ask") && (*payload)["best_ask"].is_number()) ask = (*payload)["best_ask"].get<double>();
+        if (bid>0 && ask>0) return std::make_pair(bid, ask);
+    } catch (const std::exception& e) {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[KX] Snapshot fetch failed: " << e.what() << "\n";
+    }
+    return std::nullopt;
+}
+
+// WS runner (connect, subscribe, parse, update QuoteBook)
+void run_ws_watch(
+    const std::string &ws_url,
+    const std::function<std::vector<std::pair<std::string,std::string>>()> &header_supplier,
+    const std::vector<std::string> &subscribe_candidates,
+    const std::string &alt_subscribe_json,
+    const std::string &snapshot_json,
+    QuoteBook &qb,
+    const std::string &label,
+    std::atomic<bool> &stop_flag,
+    bool verbose,
+    const std::string &host_override,
+    const std::string &sni_host_override)
+{
+    int attempt = 0;
+    // Local stateful Kalshi book (only used when label=="KX")
+    KalshiBook kx_book;
+
+    while (!stop_flag.load()) {
+        try {
+            // parse ws_url
+            std::string host, port, target;
+            if (ws_url.rfind("wss://",0)!=0) throw std::runtime_error("Only wss:// URLs supported");
+            std::string rest = ws_url.substr(6);
+            auto slash = rest.find('/');
+            if (slash==std::string::npos) { host = rest; target = "/"; } else { host = rest.substr(0,slash); target = rest.substr(slash); }
+            auto colon = host.find(':');
+            if (colon!=std::string::npos) { port = host.substr(colon+1); host = host.substr(0,colon);} else { port = "443"; }
+            asio::io_context ioc;
+            ssl::context sslctx(ssl::context::tlsv12_client);
+            sslctx.set_default_verify_paths();
+            auto headers = header_supplier ? header_supplier() : std::vector<std::pair<std::string,std::string>>{};
+
+            // If PM, try multiple known endpoint fallbacks to avoid one gateway quickly closing
+            std::vector<std::string> endpoints;
+            endpoints.push_back(ws_url);
+            if (label == "PM") {
+                // common alternates
+                endpoints.push_back("wss://clob.polymarket.com/ws");
+                endpoints.push_back("wss://ws-subscriptions-clob.polymarket.com/ws");
+                endpoints.push_back("wss://ws-subscriptions-clob.polymarket.com/ws/market");
+            }
+
+            bool connected_ok = false;
+            using ws_t = websocket::stream<beast::ssl_stream<beast::tcp_stream>>;
+            std::unique_ptr<ws_t> ws_ptr; // will hold the connected websocket
+            for (const auto &endpoint : endpoints) {
+                try {
+                    // parse endpoint into host/target/port
+                    std::string e = endpoint;
+                    if (e.rfind("wss://",0)==0) e = e.substr(6);
+                    auto s = e;
+                    auto slash2 = s.find('/');
+                    std::string ehost = (slash2==std::string::npos) ? s : s.substr(0, slash2);
+                    std::string etarget = (slash2==std::string::npos) ? std::string("/") : s.substr(slash2);
+                    std::string eport = "443";
+                    auto colon2 = ehost.find(':');
+                    if (colon2!=std::string::npos) { eport = ehost.substr(colon2+1); ehost = ehost.substr(0, colon2); }
+                    std::string tcp_host = host_override.empty()?ehost:host_override;
+                    std::string sni_host = sni_host_override.empty()?ehost:sni_host_override;
+
+                    if (verbose) { std::lock_guard lk(out_mtx); std::cerr << "["<<label<<"] trying endpoint "<<endpoint<<"\n"; }
+
+                    // connect_wss returns a websocket stream by value; capture it and move into unique_ptr
+                    auto tmp_ws = connect_wss(ioc, sslctx, tcp_host, eport, etarget, sni_host, headers);
+                    ws_ptr = std::make_unique<ws_t>(std::move(tmp_ws));
+
+                    if (verbose) { std::lock_guard lk(out_mtx); std::cerr << "["<<label<<"] connected to "<<tcp_host<<etarget<<"\n"; }
+                    ws_ptr->text(true);
+                    connected_ok = true;
+                    // replace host/port/target variables for downstream logs
+                    host = ehost; port = eport; target = etarget;
+                    break;
+                } catch (const std::exception &e) {
+                    if (verbose) {
+                        std::lock_guard lk(out_mtx);
+                        std::cerr << "["<<label<<"] endpoint "<<endpoint<<" failed: "<< e.what() <<"\n";
+                    }
+                    continue; // try next endpoint
+                }
+            }
+            if (!connected_ok) {
+                if (verbose) { std::lock_guard lk(out_mtx); std::cerr << "["<<label<<"] all endpoints failed for this attempt\n"; }
+                throw std::runtime_error("All endpoints failed");
+            }
+
+            // use ws_ptr instead of ws
+            ws_ptr->text(true);
+            if (verbose) {
+                std::lock_guard lk(out_mtx);
+                std::cerr << "["<<label<<"] Sending subscribe: " << subscribe_candidates.front() << "\n";
+            }
+            // small pause after handshake to allow server welcome/ping frames
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            // Special-case PM: try to consume any initial frames before sending subscribe to avoid race/EOF
+            if (label == "PM") {
+                beast::flat_buffer pre_buf;
+                beast::error_code ec_pre;
+                try {
+                    beast::get_lowest_layer(*ws_ptr).expires_after(std::chrono::milliseconds(500));
+                    ws_ptr->read(pre_buf, ec_pre);
+                    beast::get_lowest_layer(*ws_ptr).expires_never();
+                } catch (...) {
+                    ec_pre = beast::error_code{static_cast<int>(std::errc::io_error), asio::error::get_misc_category()};
+                }
+                if (!ec_pre) {
+                    auto pdata = beast::buffers_to_string(pre_buf.data());
+                    pre_buf.consume(pre_buf.size());
+                    try {
+                        auto pj = json::parse(pdata);
+                        if (verbose) { std::lock_guard lk(out_mtx); std::cerr << "[PM] RAW (pre-subscribe): " << pj.dump() << "\n"; }
+                        const json* payload = &pj;
+                        if (pj.contains("msg") && pj["msg"].is_object()) payload = &pj["msg"];
+                        if (pj.contains("data") && pj["data"].is_object()) payload = &pj["data"];
+                        if (payload->contains("price_changes") && (*payload)["price_changes"].is_array()) {
+                            const auto &pc = (*payload)["price_changes"];
+                            for (const auto & e : pc) {
+                                if (!e.is_object()) continue;
+                                double bb=-1, ba=-1; if (e.contains("best_bid")) { if (e["best_bid"].is_string()) bb = std::stod(e["best_bid"].get<std::string>()); else if (e["best_bid"].is_number()) bb = e["best_bid"].get<double>(); }
+                                if (e.contains("best_ask")) { if (e["best_ask"].is_string()) ba = std::stod(e["best_ask"].get<std::string>()); else if (e["best_ask"].is_number()) ba = e["best_ask"].get<double>(); }
+                                if (bb>=0 && ba>=0) { qb.set_bbo(bb,ba); if (verbose) { std::lock_guard lk(out_mtx); std::cerr<<"[PM] Applied pre-subscribe price_change bb="<<bb<<" ba="<<ba<<"\n"; } break; }
+                            }
+                        }
+                    } catch (...) { /* ignore parse errors */ }
+                }
+            }
+            std::string chosen_sub;
+            // small pause before sending subscribe
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (!subscribe_candidates.empty()) {
+                size_t idx = (subscribe_candidates.size() == 1) ? 0 : (attempt % subscribe_candidates.size());
+                chosen_sub = subscribe_candidates[idx];
+                size_t used_idx = idx;
+                if (verbose) {
+                    std::lock_guard lk(out_mtx);
+                    std::cerr << "["<<label<<"] attempt="<<attempt<<" sending subscribe candidate["<<used_idx<<"]: " << chosen_sub << "\n";
+                }
+                ws_ptr->write(asio::buffer(chosen_sub));
+            } else {
+                if (verbose) { std::lock_guard lk(out_mtx); std::cerr << "["<<label<<"] no subscribe candidates provided\n"; }
+            }
+
+            beast::flat_buffer buffer;
+            for (;;) {
+                beast::error_code ec;
+                ws_ptr->read(buffer, ec);
+                if (ec) {
+                    if (verbose) { std::lock_guard lk(out_mtx); std::cerr << "["<<label<<"] read error: "<<ec.message()<<"\n"; }
+                    break;
+                }
+                auto data = beast::buffers_to_string(buffer.data());
+                buffer.consume(buffer.size());
+
+                // Parse message
+                json j;
+                try { j = json::parse(data); } catch (...) { continue; }
+
+                // Defensive: log error frames and continue
+                if (j.value("type","") == "error") {
+                    if (verbose) {
+                        std::lock_guard lk(out_mtx);
+                        std::cerr << "["<<label<<"] ERROR frame: " << j.dump() << "\n";
+                    }
+                    continue;
+                }
+
+                // If PM verbose, dump raw PM messages so we can inspect payload shapes
+                if (label == "PM" && verbose) {
+                    std::lock_guard lk(out_mtx);
+                    std::cerr << "[PM] RAW: " << j.dump() << "\n";
+                }
+
+                // KX: Prefer the `data` object (Kalshi uses `data` for orderbook payloads).
+                if (label == "KX") {
+                    const std::string mtype = j.value("type", "");
+                    const json* data_obj = nullptr;
+                    if (j.contains("data") && j["data"].is_object()) data_obj = &j["data"];
+                    else if (j.contains("msg") && j["msg"].is_object()) data_obj = &j["msg"];
+                    else data_obj = &j;
+
+                    if (mtype == "orderbook_snapshot") {
+                        if (verbose) {
+                            std::lock_guard lk(out_mtx);
+                            std::cerr << "[KX] SNAP payload: " << data_obj->dump() << "\n";
+                        }
+
+                        // Feed full snapshot into the KalshiBook stateful object
+                        kx_book.apply_snapshot(*data_obj);
+                        auto [bid_opt, ask_opt] = kx_book.bbo_yes();
+                        if (bid_opt && ask_opt) {
+                            qb.set_bbo(*bid_opt, *ask_opt);
+                        } else {
+                            if (verbose) {
+                                std::lock_guard lk(out_mtx);
+                                std::cerr << "[KX] snapshot contained no YES/NO levels\n";
+                            }
+                        }
+                        continue;
+                    } else if (mtype == "orderbook_delta") {
+                        if (verbose) {
+                            std::lock_guard lk(out_mtx);
+                            std::cerr << "[KX] DELTA payload: " << data_obj->dump() << "\n";
+                        }
+
+                        // Apply incremental update
+                        kx_book.apply_delta(*data_obj);
+                        auto [bid_opt, ask_opt] = kx_book.bbo_yes();
+                        if (bid_opt && ask_opt) {
+                            qb.set_bbo(*bid_opt, *ask_opt);
+                        } else if (bid_opt) {
+                            qb.set_bid(*bid_opt);
+                        } else if (ask_opt) {
+                            qb.set_ask(*ask_opt);
+                        }
+                        continue;
+                    }
+                }
+
+                // Generic fallback parsing (PM or other payloads)
+                const json* payload = &j;
+                if (j.contains("msg") && j["msg"].is_object()) payload = &j["msg"];
+                if (j.contains("data") && j["data"].is_object()) payload = &j["data"];
+
+                // Polymarket-specific: handle price_changes arrays (preferred source of L2 updates)
+                if (label == "PM" && payload->contains("price_changes") && (*payload)["price_changes"].is_array()) {
+                    const auto &pc = (*payload)["price_changes"];
+                    bool applied = false;
+
+                    // Helper to parse best_bid/best_ask from an entry
+                    auto parse_bb_ba = [&](const json &e, double &out_bb, double &out_ba) {
+                        out_bb = -1.0; out_ba = -1.0;
+                        try {
+                            if (e.contains("best_bid")) {
+                                if (e["best_bid"].is_string()) out_bb = std::stod(e["best_bid"].get<std::string>());
+                                else if (e["best_bid"].is_number()) out_bb = e["best_bid"].get<double>();
+                            }
+                            if (e.contains("best_ask")) {
+                                if (e["best_ask"].is_string()) out_ba = std::stod(e["best_ask"].get<std::string>());
+                                else if (e["best_ask"].is_number()) out_ba = e["best_ask"].get<double>();
+                            }
+                        } catch (...) { /* ignore parse errors */ }
+                    };
+
+                    // 1) Preferentially apply the entry that matches our YES token (if known)
+                    if (!g_pm_yes_token.empty()) {
+                        for (const auto &e : pc) {
+                            if (!e.is_object()) continue;
+                            std::string asset = e.value("asset_id", "");
+                            if (asset != g_pm_yes_token) continue;
+                            double bb, ba; parse_bb_ba(e, bb, ba);
+                            if (bb >= 0 && ba >= 0) {
+                                qb.set_bbo(bb, ba);
+                                applied = true;
+                                if (verbose) { std::lock_guard lk(out_mtx); std::cerr << "[PM] Applied price_change for YES asset "<<asset<<" bb="<<bb<<" ba="<<ba<<"\n"; }
+                                break;
+                            }
+                        }
+                    }
+
+                    // 2) Fallback: apply the first price_change entry that exposes both best_bid and best_ask
+                    if (!applied) {
+                        for (const auto &e : pc) {
+                            if (!e.is_object()) continue;
+                            double bb, ba; parse_bb_ba(e, bb, ba);
+                            if (bb >= 0 && ba >= 0) {
+                                qb.set_bbo(bb, ba);
+                                applied = true;
+                                if (verbose) { std::lock_guard lk(out_mtx); std::cerr << "[PM] Applied price_change fallback bb="<<bb<<" ba="<<ba<<"\n"; }
+                                break;
+                            }
+                        }
+                    }
+
+                    if (applied) continue; // handled
+                }
+
+                auto bb = extract_best_bid(*payload);
+                auto ba = extract_best_ask(*payload);
+                if (bb && ba) qb.set_bbo(*bb, *ba);
+                else {
+                    if (bb) qb.set_bid(*bb);
+                    if (ba) qb.set_ask(*ba);
+                }
+            }
+            beast::error_code ignore;
+            ws_ptr->close(websocket::close_code::normal, ignore);
+        } catch (const std::exception& e) {
+            if (verbose) { std::lock_guard lk(out_mtx); std::cerr << "["<<label<<"] exception: "<<e.what()<<"\n"; }
+        }
+        if (stop_flag.load()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(5000, 250 * std::max(1, ++attempt))));
+    }
+}
+
+
+websocket::stream<beast::ssl_stream<beast::tcp_stream>> connect_wss(
+    asio::io_context& ioc,
+    ssl::context& sslctx,
+    const std::string& host_for_tcp,
+    const std::string& port,
+    const std::string& target,
+    const std::string& sni_host,
+    const std::vector<std::pair<std::string,std::string>>& extra_headers)
+{
+    // Resolve and connect TCP
+    tcp::resolver resolver{ioc};
+    auto const results = resolver.resolve(host_for_tcp, port);
+    beast::tcp_stream tcp_stream{ioc};
+    tcp_stream.connect(results);
+
+    // Establish TLS on top of the TCP stream
+    beast::ssl_stream<beast::tcp_stream> tls_stream{std::move(tcp_stream), sslctx};
+    if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), sni_host.c_str())) {
+        throw std::runtime_error("Failed to set SNI host");
+    }
+    tls_stream.handshake(ssl::stream_base::client);
+
+    // Create websocket stream on top of TLS stream
+    websocket::stream<beast::ssl_stream<beast::tcp_stream>> ws{std::move(tls_stream)};
+
+    // Attach optional headers via decorator
+    ws.set_option(websocket::stream_base::decorator([&](websocket::request_type& req){
+        for (const auto &h : extra_headers) {
+            req.set(h.first, h.second);
+        }
+        req.set(http::field::user_agent, "arb-ws-watcher/1.0");
+    }));
+
+    // Perform the websocket client handshake using sni_host as Host header
+    ws.handshake(sni_host, target);
+
+    return ws;
+}
+
+// Fetch orderbook from Polymarket CLOB REST endpoint (clob.polymarket.com)
+static PMBook fetch_pm_clob_book(const std::string &token_id) {
+    PMBook out;
+    if (token_id.empty()) return out;
+    try {
+        asio::io_context ioc;
+        ssl::context sslctx(ssl::context::tlsv12_client);
+        sslctx.set_default_verify_paths();
+
+        const std::string host = "clob.polymarket.com";
+        tcp::resolver resolver{ioc};
+        auto const results = resolver.resolve(host, "443");
+        beast::tcp_stream tcp_stream{ioc};
+        tcp_stream.connect(results);
+
+        beast::ssl_stream<beast::tcp_stream> tls_stream{std::move(tcp_stream), sslctx};
+        if(!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str())) return out;
+        beast::get_lowest_layer(tls_stream).expires_after(std::chrono::seconds(10));
+        tls_stream.handshake(ssl::stream_base::client);
+
+        std::string target = "/book?token_id=" + token_id;
+        http::request<http::string_body> req{http::verb::get, target, 11};
+        req.set(http::field::host, host);
+        req.set(http::field::user_agent, "arb-ws-watcher/1.0");
+
+        http::write(tls_stream, req);
+        beast::flat_buffer buffer;
+        http::response<http::string_body> res;
+        http::read(tls_stream, buffer, res);
+        if (res.result() != http::status::ok) return out;
+
+        auto j = json::parse(res.body());
+        if (j.is_object()) {
+            if (j.contains("bids") && j["bids"].is_array()) {
+                if (auto mx = max_price_in_levels(j["bids"])) out.best_bid = *mx;
+            }
+            if (j.contains("asks") && j["asks"].is_array()) {
+                if (auto mn = min_price_in_levels(j["asks"])) out.best_ask = *mn;
+            }
+            if ((!out.best_bid || !out.best_ask) && j.contains("orderbook") && j["orderbook"].is_object()) {
+                const json &ob = j["orderbook"];
+                if (!out.best_bid && ob.contains("bids") && ob["bids"].is_array()) if (auto mx = max_price_in_levels(ob["bids"])) out.best_bid = *mx;
+                if (!out.best_ask && ob.contains("asks") && ob["asks"].is_array()) if (auto mn = min_price_in_levels(ob["asks"])) out.best_ask = *mn;
+            }
+        }
+
+        beast::error_code ec;
+        tls_stream.shutdown(ec);
+    } catch (const std::exception &e) {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[PM] fetch_clob_book error: " << e.what() << "\n";
+    }
+    return out;
+}
+
+// simple arbitrage loop using two QuoteBooks
+void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
+                    int pm_fee_bps, int kx_fee_bps, int min_edge_bps,
+                    std::atomic<bool> &stop_flag,
+                    int stale_ms, int max_skew_ms, int ping_ms,
+                    const std::string& windows_csv,
+                    bool verbose)
+{
+    using clock = std::chrono::steady_clock;
+    auto heartbeat_interval = std::chrono::seconds(5); // fixed heartbeat every 5s
+    auto next_heartbeat = clock::now() + heartbeat_interval;
+
+    // ping_ms is used as freshness window for validating arb opportunities.
+    // Relax it to a practical minimum and ensure we also respect stale_ms and max_skew_ms.
+    int verify_window_ms = (ping_ms > 0 ? ping_ms : 200);
+    verify_window_ms = std::max(verify_window_ms, 250); // don't use extremely tiny windows
+    const int max_verify_attempts = 3;
+
+    while (!stop_flag.load()) {
+        auto now = clock::now();
+        auto pm = pm_q.snap();
+        auto kx = kx_q.snap();
+
+        // compute ages (ms)
+        long pm_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pm.ts).count();
+        long kx_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - kx.ts).count();
+
+        // If PM quotes are missing or stale (older than half the heartbeat interval), try a REST fallback
+        if ((!pm.bid || !pm.ask) || pm_age_ms > std::chrono::duration_cast<std::chrono::milliseconds>(heartbeat_interval/2).count()) {
+            if (!g_pm_yes_token.empty()) {
+                auto fb = fetch_pm_clob_book(g_pm_yes_token);
+                if (fb.best_bid && fb.best_ask) {
+                    pm_q.set_bbo(*fb.best_bid, *fb.best_ask);
+                    // refresh snapshot
+                    pm = pm_q.snap();
+                    pm_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pm.ts).count();
+                    std::lock_guard lk(out_mtx);
+                    std::cerr << "[PM] REST fallback applied: bb="<<*fb.best_bid<<" ba="<<*fb.best_ask<<"\n";
+                }
+            }
+        }
+
+        // If we have both sides, compute candidate edges for both directions (PM->KX and KX->PM)
+        if (pm.bid && pm.ask && kx.bid && kx.ask) {
+            // compute a relaxed verify window and also respect stale_ms/max_skew_ms
+            int relaxed_verify_window_ms = verify_window_ms; // already >= 250
+
+            auto check_direction = [&](double sell_bid, double buy_ask,
+                                       int sell_fee_bps, int buy_fee_bps,
+                                       const char* label) {
+                double sell_net  = sell_bid * (1.0 - sell_fee_bps/10000.0);
+                double buy_gross = buy_ask  * (1.0 + buy_fee_bps/10000.0);
+                double raw       = sell_net - buy_gross;
+                double cap       = (1.0 - sell_bid) + buy_ask;
+                double bps_cap   = (cap>0? raw/cap : 0.0) * 10000.0;
+
+                if (bps_cap < min_edge_bps) {
+                    // candidate too small, log only in verbose mode for debugging
+                    if (verbose) {
+                        std::lock_guard lk(out_mtx);
+                        std::cerr << "[ARB-CHECK]["<<label<<"] raw="<<raw<<" bps="<<bps_cap
+                                  <<" sell_net="<<sell_net<<" buy_gross="<<buy_gross<<"\n";
+                    }
+                } else {
+                    // Log candidate (verbose)
+                    if (verbose) {
+                        std::lock_guard lk(out_mtx);
+                        std::cerr << "[ARB-CAND]["<<label<<"] raw="<<raw<<" bps="<<bps_cap
+                                  <<" sell_net="<<sell_net<<" buy_gross="<<buy_gross<<"\n";
+                    }
+                }
+
+                // Verify freshness using relaxed_verify_window_ms; attempt a few re-checks
+                bool verified = false;
+                for (int attempt = 0; attempt < max_verify_attempts && !verified && !stop_flag.load(); ++attempt) {
+                    auto now2 = clock::now();
+                    auto pm2 = pm_q.snap();
+                    auto kx2 = kx_q.snap();
+                    long pm2_age = std::chrono::duration_cast<std::chrono::milliseconds>(now2 - pm2.ts).count();
+                    long kx2_age = std::chrono::duration_cast<std::chrono::milliseconds>(now2 - kx2.ts).count();
+
+                    // require both sides fresh within relaxed window
+                    if (pm2_age <= relaxed_verify_window_ms && kx2_age <= relaxed_verify_window_ms) {
+                        // pick freshest values depending on direction: sell may come from PM or KX
+                        double sell_bid2 = (label[0]=='P' ? (pm2.bid?*pm2.bid: -1.0) : (kx2.bid?*kx2.bid: -1.0));
+                        double buy_ask2  = (label[0]=='P' ? (kx2.ask?*kx2.ask: -1.0) : (pm2.ask?*pm2.ask: -1.0));
+
+                        if (sell_bid2 > 0 && buy_ask2 > 0) {
+                            double sell_net2  = sell_bid2 * (1.0 - sell_fee_bps/10000.0);
+                            double buy_gross2 = buy_ask2  * (1.0 + buy_fee_bps/10000.0);
+                            double raw2 = sell_net2 - buy_gross2;
+                            double cap2 = (1.0 - sell_bid2) + buy_ask2;
+                            double bps_cap2 = (cap2>0? raw2/cap2 : 0.0) * 10000.0;
+
+                            if (bps_cap2 >= min_edge_bps) {
+                                verified = true;
+                                std::lock_guard lk(out_mtx);
+                                std::cout << "[ARB-OPEN] "<<label<<" sell@"<<sell_bid2<<" buy@"<<buy_ask2
+                                          <<" bps_capital="<<bps_cap2<<"\n";
+                            } else {
+                                if (attempt == 0 && verbose) {
+                                    std::lock_guard lk(out_mtx);
+                                    std::cerr << "[ARB-VERIFY] candidate edge disappeared on recheck (bps_cap="<<bps_cap2<<")\n";
+                                }
+                            }
+                        }
+                    } else {
+                        if (attempt < max_verify_attempts - 1) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(std::max(50, relaxed_verify_window_ms/2)));
+                        } else if (verbose) {
+                            std::lock_guard lk(out_mtx);
+                            std::cerr << "[ARB-VERIFY] candidate not verified: pm_age="<<pm2_age<<"ms kx_age="<<kx2_age
+                                      <<"ms (window="<<relaxed_verify_window_ms<<"ms)\n";
+                        }
+                    }
+                }
+            };
+
+            // Direction A: PM-sell / KX-buy (PM -> KX)
+            check_direction(*pm.bid, *kx.ask, pm_fee_bps, kx_fee_bps, "PM->KX");
+            // Direction B: KX-sell / PM-buy (KX -> PM)
+            check_direction(*kx.bid, *pm.ask, kx_fee_bps, pm_fee_bps, "KX->PM");
+        }
+
+        // Heartbeat: print once every heartbeat_interval with current quotes and ages
+        now = clock::now();
+        if (now >= next_heartbeat) {
+            std::ostringstream hb;
+            hb << std::fixed << std::setprecision(6);
+            hb << "[HEARTBEAT] ";
+            if (pm.bid) hb << "pm_bid=" << *pm.bid; else hb << "pm_bid=NA";
+            hb << " ";
+            if (pm.ask) hb << "pm_ask=" << *pm.ask; else hb << "pm_ask=NA";
+            hb << " ";
+            if (kx.bid) hb << "kx_bid=" << *kx.bid; else hb << "kx_bid=NA";
+            hb << " ";
+            if (kx.ask) hb << "kx_ask=" << *kx.ask; else hb << "kx_ask=NA";
+            hb << " age_ms pm=" << pm_age_ms << " kx=" << kx_age_ms;
+
+            if (verbose) {
+                std::lock_guard lk(out_mtx);
+                std::cout << hb.str() << std::endl;
+            }
+            next_heartbeat = now + heartbeat_interval;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
