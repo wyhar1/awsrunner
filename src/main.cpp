@@ -34,6 +34,9 @@ namespace asio  = boost::asio;
 namespace ssl   = asio::ssl;
 using tcp = asio::ip::tcp;
 
+// Forward declaration so we can use this in make_kalshi_rest_auth_headers
+std::string sign_pss_base64(EVP_PKEY* pkey, const std::string& msg);
+
 static std::mutex out_mtx;
 static std::string g_pm_yes_token;
 static std::string g_pm_no_token;
@@ -107,7 +110,56 @@ void run_ws_watch(
     const std::string &host_override,
     const std::string &sni_host_override);
 
+// ---- Trading client interfaces (single-box) ----
+// Wraps HTTPS calls to Kalshi's Trade API v2.
+struct KalshiTradingClient {
+    std::string host = "api.elections.kalshi.com";
+    std::string key_id;
+    EVP_PKEY*  pkey = nullptr;
+    std::string default_ticker; // fallback ticker if none supplied
+
+    // Place IOC limit order. side: "BUY" or "SELL"
+    bool place_ioc_order(const std::string& ticker,
+                         const std::string& side,
+                         double price,
+                         int size) const;
+};
+
+// Facade around Polymarket CLOB client. Calls a local Python executor to place orders.
+struct PolymarketTradingClient {
+    std::string yes_token_id;       // PM YES asset id for this market
+    std::string exec_script_path;   // e.g. "/usr/local/bin/pm_place_order.py"
+
+    // side: "buy" or "sell"; price in dollars; size in shares.
+    bool place_ioc_order(const std::string& side, double price, int size) const;
+};
+
+// ---- Kalshi auth headers for REST (method + path [+ body]) ----
+std::vector<std::pair<std::string,std::string>> make_kalshi_rest_auth_headers(const std::string& key_id,
+                                                                              EVP_PKEY* pkey,
+                                                                              const std::string& method,
+                                                                              const std::string& path,
+                                                                              const std::string& body = "") {
+    using namespace std::chrono;
+    auto ms   = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    std::string ts = std::to_string(ms);
+    const std::string to_sign = ts + method + path + body;
+    const std::string sig_b64 = sign_pss_base64(pkey, to_sign);
+    if (sig_b64.empty()) {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[KX] ERROR: Failed to generate REST RSA-PSS signature\n";
+    }
+    return {
+        {"KALSHI-ACCESS-KEY",       key_id},
+        {"KALSHI-ACCESS-SIGNATURE", sig_b64},
+        {"KALSHI-ACCESS-TIMESTAMP", ts}
+    };
+}
+
+// New arbitrage_loop declaration (uses trading clients)
 void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
+                    const PolymarketTradingClient &pm_client,
+                    const KalshiTradingClient     &kx_client,
                     int pm_fee_bps, int kx_fee_bps, int min_edge_bps,
                     std::atomic<bool> &stop_flag,
                     int stale_ms, int max_skew_ms, int ping_ms,
@@ -1073,6 +1125,20 @@ int main(int argc, char **argv) {
     QuoteBook pm_q, kx_q;
     std::atomic<bool> stop_flag{false};
 
+    // ---- Trading clients (single-box execution) ----
+    KalshiTradingClient kx_trader_client;
+    kx_trader_client.key_id = kalshi_key;
+    kx_trader_client.pkey   = kalshi_pkey;
+
+    PolymarketTradingClient pm_trader_client;
+    pm_trader_client.yes_token_id = pm_yes_token;
+    // Point to the local Python executor that uses py_clob_client. Adjust if you keep it elsewhere.
+    pm_trader_client.exec_script_path = "/Users/wyattharris/Desktop/Prediction-Exploits/pm_place_order.py";
+
+
+    // Set default ticker for Kalshi trading client so fire_kx("", ...) can fall back to it
+    kx_trader_client.default_ticker = kx_ticker;
+
     // Seed initial Kalshi quotes from REST snapshot (avoids sitting on NAs waiting for first delta)
     // Try to seed from the best candidate: prefer normalized subscribe ticker, fall back to raw CSV ticker
     const std::string snapshot_ticker = !kx_subscribe_ticker.empty() ? kx_subscribe_ticker : kx_ticker;
@@ -1162,7 +1228,7 @@ int main(int argc, char **argv) {
         run_ws_watch(kx_ws, kx_header_supplier, {kx_sub}, kx_sub_alt, kx_snapshot, kx_q, "KX", stop_flag, /*verbose=*/global_verbose, kalshi_host_override, kalshi_sni_host);
     });
     std::thread t_arb([&](){
-        arbitrage_loop(pm_q, kx_q, pm_fee_bps, kx_fee_bps, min_edge_bps, stop_flag,
+        arbitrage_loop(pm_q, kx_q, pm_trader_client, kx_trader_client, pm_fee_bps, kx_fee_bps, min_edge_bps, stop_flag,
                        stale_ms, max_skew_ms, ping_ms, windows_csv, global_verbose);
     });
 
@@ -1708,6 +1774,8 @@ static PMBook fetch_pm_clob_book(const std::string &token_id) {
 
 // simple arbitrage loop using two QuoteBooks
 void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
+                    const PolymarketTradingClient &pm_client,
+                    const KalshiTradingClient     &kx_client,
                     int pm_fee_bps, int kx_fee_bps, int min_edge_bps,
                     std::atomic<bool> &stop_flag,
                     int stale_ms, int max_skew_ms, int ping_ms,
@@ -1723,6 +1791,45 @@ void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
     int verify_window_ms = (ping_ms > 0 ? ping_ms : 200);
     verify_window_ms = std::max(verify_window_ms, 250); // don't use extremely tiny windows
     const int max_verify_attempts = 3;
+
+    // Helper: fire a Polymarket order via pm_trader. Token ID comes from g_pm_yes_token or PM_YES_TOKEN env
+    auto fire_pm = [&](const std::string &token_id, double px, int shares){
+        std::string tid = token_id;
+        if (tid.empty()) {
+            if (const char* e = std::getenv("PM_YES_TOKEN")) tid = e;
+            if (tid.empty() && !g_pm_yes_token.empty()) tid = g_pm_yes_token;
+        }
+        // prefer pm_client's internal token if available
+        if (tid.empty() && !pm_client.yes_token_id.empty()) tid = pm_client.yes_token_id;
+        if (tid.empty()) {
+            std::lock_guard lk(out_mtx);
+            std::cerr << "[FIRE-PM] no token id available; would have placed PM order sell@"<<px<<" qty="<<shares<<"\n";
+            return;
+        }
+        // Temporarily set client token if different
+        PolymarketTradingClient tmp_client = pm_client; // copy
+        tmp_client.yes_token_id = tid;
+        bool ok = tmp_client.place_ioc_order("sell", px, shares);
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[FIRE-PM] placed sell order via pm_client: price="<<px<<" qty="<<shares<<" ok="<<ok<<"\n";
+    };
+
+    // Helper: fire a Kalshi order via KalshiTradingClient
+    auto fire_kx = [&](const std::string &kx_ticker_arg, const std::string &side, double px, int qty){
+        std::string ticker = kx_ticker_arg;
+        if (ticker.empty()) {
+            if (const char* e = std::getenv("KALSHI_TICKER")) ticker = e;
+            if (ticker.empty() && !kx_client.default_ticker.empty()) ticker = kx_client.default_ticker;
+        }
+        if (ticker.empty()) {
+            std::lock_guard lk(out_mtx);
+            std::cerr << "[FIRE-KX] missing ticker; would have placed KX order "<<side<<"@"<<px<<" qty="<<qty<<"\n";
+            return;
+        }
+        bool ok = kx_client.place_ioc_order(ticker, boost::to_upper_copy(side), px, qty);
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[FIRE-KX] placed KX order: ticker="<<ticker<<" side="<<side<<" price="<<px<<" qty="<<qty<<" ok="<<ok<<"\n";
+    };
 
     while (!stop_flag.load()) {
         auto now = clock::now();
@@ -1802,9 +1909,26 @@ void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
 
                             if (bps_cap2 >= min_edge_bps) {
                                 verified = true;
-                                std::lock_guard lk(out_mtx);
-                                std::cout << "[ARB-OPEN] "<<label<<" sell@"<<sell_bid2<<" buy@"<<buy_ask2
-                                          <<" bps_capital="<<bps_cap2<<"\n";
+                                // On open, perform same logging, then trigger order leg(s)
+                                {
+                                    std::lock_guard lk(out_mtx);
+                                    std::cout << "[ARB-OPEN] "<<label<<" sell@"<<sell_bid2<<" buy@"<<buy_ask2
+                                              <<" bps_capital="<<bps_cap2<<"\n";
+                                }
+                                // Fire execution depending on direction
+                                int shares = 1;
+                                if (const char* e = std::getenv("ARB_SHARES")) {
+                                    try { shares = std::stoi(e); } catch(...) { shares = 1; }
+                                }
+                                if (std::string(label) == "PM->KX") {
+                                    // PM sell at sell_bid2, KX buy at buy_ask2
+                                    fire_pm("", sell_bid2, shares);
+                                    fire_kx("", "buy", buy_ask2, shares);
+                                } else if (std::string(label) == "KX->PM") {
+                                    // KX sell at sell_bid2, PM buy at buy_ask2
+                                    fire_kx("", "sell", sell_bid2, shares);
+                                    fire_pm("", buy_ask2, shares);
+                                }
                             } else {
                                 if (attempt == 0 && verbose) {
                                     std::lock_guard lk(out_mtx);
@@ -1853,6 +1977,100 @@ void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+// ---- Trading client implementations ----
+bool KalshiTradingClient::place_ioc_order(const std::string& ticker,
+                                          const std::string& side,
+                                          double price,
+                                          int size) const {
+    if (key_id.empty() || !pkey || ticker.empty() || size <= 0) {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[KX-TRADE] missing credentials or bad params; not sending order\n";
+        return false;
+    }
+    try {
+        asio::io_context ioc;
+        ssl::context sslctx(ssl::context::tlsv12_client);
+        sslctx.set_default_verify_paths();
+
+        tcp::resolver resolver{ioc};
+        auto results = resolver.resolve(host, "443");
+        beast::tcp_stream tcp_stream{ioc};
+        tcp_stream.connect(results);
+
+        beast::ssl_stream<beast::tcp_stream> tls_stream{std::move(tcp_stream), sslctx};
+        if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str()))
+            throw std::runtime_error("KX-TRADE: failed to set SNI");
+
+        beast::get_lowest_layer(tls_stream).expires_after(std::chrono::seconds(10));
+        tls_stream.handshake(ssl::stream_base::client);
+
+        const std::string path = "/trade-api/v2/portfolio/orders";
+
+        json body = {
+            {"ticker", ticker},
+            {"side",   side},
+            {"type",   "LIMIT"},
+            {"time_in_force", "IOC"},
+            {"size",   size},
+            {"limit_price", price}
+        };
+        const std::string body_str = body.dump();
+
+        auto headers = make_kalshi_rest_auth_headers(key_id, pkey, "POST", path, body_str);
+
+        http::request<http::string_body> req{http::verb::post, path, 11};
+        req.set(http::field::host, host);
+        req.set(http::field::user_agent, "arb-ws-watcher/1.0");
+        req.set(http::field::content_type, "application/json");
+        req.body() = body_str;
+        req.prepare_payload();
+        for (auto& h : headers) req.set(h.first, h.second);
+
+        http::write(tls_stream, req);
+        beast::flat_buffer buffer;
+        http::response<http::string_body> res;
+        http::read(tls_stream, buffer, res);
+        {
+            std::lock_guard lk(out_mtx);
+            std::cerr << "[KX-TRADE] HTTP " << static_cast<unsigned>(res.result()) << " body=" << res.body() << "\n";
+        }
+        beast::error_code ec;
+        tls_stream.shutdown(ec);
+        return res.result() == http::status::ok || res.result() == http::status::created;
+    } catch (const std::exception& e) {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[KX-TRADE] exception: " << e.what() << "\n";
+        return false;
+    }
+}
+
+bool PolymarketTradingClient::place_ioc_order(const std::string& side, double price, int size) const {
+    if (yes_token_id.empty() || exec_script_path.empty() || size <= 0) {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[PM-TRADE] missing token or script path; not sending order\n";
+        return false;
+    }
+    try {
+        std::ostringstream cmd;
+        cmd << "python3 '" << exec_script_path << "'"
+            << " --token-id '" << yes_token_id << "'"
+            << " --side " << side
+            << " --price " << std::fixed << std::setprecision(4) << price
+            << " --size " << size
+            << " --tif IOC";
+        int rc = std::system(cmd.str().c_str());
+        {
+            std::lock_guard lk(out_mtx);
+            std::cerr << "[PM-TRADE] cmd='" << cmd.str() << "' rc=" << rc << "\n";
+        }
+        return rc == 0;
+    } catch (const std::exception& e) {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[PM-TRADE] exception: " << e.what() << "\n";
+        return false;
     }
 }
 

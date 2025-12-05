@@ -23,8 +23,14 @@ from typing import Any, Dict, List, Optional, Tuple, Iterable
 import requests
 import pandas as pd
 
+import base64
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
 POLY_GAMMA = "https://gamma-api.polymarket.com"
-KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_HOST = "https://api.elections.kalshi.com"
+KALSHI_PATH_PREFIX = "/trade-api/v2"
 
 # Single-game series on Kalshi
 KALSHI_GAME_SERIES = {
@@ -57,6 +63,55 @@ def safe_get(url, params=None, headers=None, timeout=25) -> Any:
     r = requests.get(url, params=params or {}, headers=headers or {}, timeout=timeout)
     r.raise_for_status()
     return r.json()
+
+
+# ---------------- Kalshi authenticated helper ----------------
+class KalshiAuth:
+    def __init__(self, api_key: str, private_key_path: str):
+        self.api_key = api_key
+        self.private_key = self._load_private_key(private_key_path)
+
+    def _load_private_key(self, path: str):
+        with open(path, "rb") as f:
+            return load_pem_private_key(f.read(), password=None)
+
+    def _generate_auth_headers(self, http_method: str, request_path: str) -> Dict[str, str]:
+        """
+        http_method: "GET", "POST", etc.
+        request_path: e.g. "/trade-api/v2/events"
+        """
+        timestamp = str(int(time.time() * 1000))
+        message = f"{timestamp}{http_method}{request_path}".encode()
+        signature = self.private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256(),
+        )
+        encoded = base64.b64encode(signature).decode()
+        return {
+            "KALSHI-ACCESS-KEY": self.api_key,
+            "KALSHI-ACCESS-SIGNATURE": encoded,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "Content-Type": "application/json",
+        }
+
+
+def kalshi_get(auth: KalshiAuth, path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 25) -> Any:
+    """
+    Authenticated GET to Kalshi.
+
+    path: "/trade-api/v2/events", "/trade-api/v2/series", etc.
+    """
+    params = params or {}
+    url = f"{KALSHI_HOST}{path}"
+    headers = auth._generate_auth_headers("GET", path)
+    r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
 
 # ---------- Polymarket: discover sports tags ----------
 def _pm_get_sport_tag_ids(debug=False) -> set[int]:
@@ -279,7 +334,17 @@ def kalshi_suffix_from_event_ticker(et: str) -> Optional[str]:
     return suf
 
 def _kalshi_series_sports(debug=False) -> list[str]:
-    data = safe_get(f"{KALSHI_BASE}/series", params={"category": "Sports"})
+    # legacy shim: keep original signature for compatibility; prefer using the auth-aware variant below
+    raise RuntimeError("Use _kalshi_series_sports(auth, debug) instead")
+
+
+def _kalshi_series_sports(auth: KalshiAuth, debug=False) -> list[str]:
+    try:
+        data = kalshi_get(auth, f"{KALSHI_PATH_PREFIX}/series", params={"category": "Sports"})
+    except Exception as e:
+        if debug:
+            print(f"[Kalshi] ERROR fetching series: {e}")
+        return []
     series = data.get("series", []) if isinstance(data, dict) else []
     tickers = [s.get("ticker") for s in series if s.get("ticker")]
     game_series = [t for t in tickers if t in KALSHI_GAME_SERIES]
@@ -287,60 +352,98 @@ def _kalshi_series_sports(debug=False) -> list[str]:
         print(f"[Kalshi] sports series total: {len(tickers)} | single-game filtered: {len(game_series)}")
     return game_series
 
-def _kalshi_markets_for_series(series_ticker: str, statuses: str, min_close_ts: int) -> list[dict]:
-    out, cursor = [], None
-    while True:
-        params = {
-            "series_ticker": series_ticker,
-            "status": statuses,            # "open,unopened"
-            "min_close_ts": min_close_ts,  # still open or future
-            "limit": 1000,
-            "mve_filter": "exclude",       # exclude multivariate
-        }
-        if cursor:
-            params["cursor"] = cursor
-        data = safe_get(f"{KALSHI_BASE}/markets", params=params)
-        mkts = data.get("markets", []) if isinstance(data, dict) else []
-        out.extend(mkts)
-        cursor = data.get("cursor")
-        if not cursor:
-            break
-        time.sleep(0.02)
+
+def _kalshi_markets_for_series(
+    auth: KalshiAuth,
+    series_ticker: str,
+    statuses: Iterable[str] = ("open", "unopened"),
+    debug: bool = False,
+) -> list[dict]:
+    """
+    Authenticated fetch of markets for a single-game sports series.
+
+    We call /markets once per status (e.g., "open" and "unopened") because
+    Kalshi only allows a single status value per request.
+    """
+    out: list[dict] = []
+
+    for status in statuses:
+        cursor: Optional[str] = None
+
+        while True:
+            params = {
+                "series_ticker": series_ticker,
+                "status": status,  # e.g. "open" OR "unopened"
+                "limit": 1000,
+                "mve_filter": "exclude",  # no multivariate
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            try:
+                data = kalshi_get(auth, f"{KALSHI_PATH_PREFIX}/markets", params=params)
+            except requests.exceptions.HTTPError as e:
+                try:
+                    body = e.response.text
+                except Exception:
+                    body = "<no body>"
+                print(f"[Kalshi] ERROR fetching markets for series {series_ticker} (status={status}): {e} | body={body}")
+                break
+            except Exception as e:
+                print(f"[Kalshi] ERROR fetching markets for series {series_ticker} (status={status}): {e}")
+                break
+
+            mkts = data.get("markets", []) if isinstance(data, dict) else []
+            if not mkts:
+                break
+
+            out.extend(mkts)
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+
+            time.sleep(0.02)
+
+    if debug:
+        print(f"[Kalshi] {series_ticker}: markets fetched {len(out)}")
     return out
 
-def fetch_kalshi_event_pairs_from_markets(debug=False) -> list[dict]:
+
+def fetch_kalshi_event_pairs_from_markets(auth: KalshiAuth, debug=False) -> list[dict]:
     """
-    For each single-game event:
-      - collect ALL markets (binary/categorical)
-      - derive team codes from:
-         (a) concatenated pair segments anywhere in the ticker (TOTAL/OU/SPREAD safe),
-         (b) moneyline last-segment single codes,
-      - if we have any pair candidates, use one; else form a pair from two singles,
-      - hydrate strike_date once per event.
+    Derive Kalshi pair codes from *markets* for all single-game sports series.
+
+    Steps:
+      1. Get sports game series via /series.
+      2. For each series_ticker, fetch markets via /markets (open,unopened).
+      3. Group markets by event_ticker.
+      4. Infer team pairs:
+           - first from event_ticker suffix (e.g. BOSORL → (BOS, ORL)),
+           - then from market tickers via _kalshi_pairs_from_ticker.
+      5. Hydrate strike_date via /events/{event_ticker}.
     """
-    series = _kalshi_series_sports(debug=debug)
+    series = _kalshi_series_sports(auth, debug=debug)
     if not series:
+        if debug:
+            print("[Kalshi] no single-game sports series found.")
         return []
 
-    now_ts = int(now_utc().timestamp())
-    statuses = "open,unopened"
+    # --- 1) collect all markets across all series ---
+    all_markets: list[dict] = []
+    statuses = ("open", "unopened")
 
-    # fetch all relevant markets across series
-    mkts: list[dict] = []
     for ser in series:
-        m = _kalshi_markets_for_series(ser, statuses=statuses, min_close_ts=now_ts)
-        if debug:
-            print(f"[Kalshi] {ser}: markets fetched {len(m)}")
-        mkts.extend(m)
+        mkts = _kalshi_markets_for_series(auth, ser, statuses=statuses, debug=debug)
+        all_markets.extend(mkts)
         time.sleep(0.01)
 
-    # group markets by event
-    ev_to_markets: dict[str, list[dict]] = {}
-    for m in mkts:
-        et = m.get("event_ticker")
+    # --- 2) group markets by event_ticker ---
+    ev_to_markets: Dict[str, list[dict]] = {}
+    for m in all_markets:
+        et = m.get("event_ticker") or m.get("eventTicker")
         if not et:
             continue
-        # keep sports-y markets only (binary or categorical)
+        # only keep binary / categorical sports-style markets
         if m.get("market_type") not in {"binary", "categorical"}:
             continue
         ev_to_markets.setdefault(et, []).append(m)
@@ -348,49 +451,49 @@ def fetch_kalshi_event_pairs_from_markets(debug=False) -> list[dict]:
     if debug:
         print(f"[Kalshi] unique event tickers (GAME markets): {len(ev_to_markets)}")
 
-    # hydrate event metadata (strike_date) once per event
-    strike_map: dict[str, Optional[datetime]] = {}
+    # --- 3) hydrate strike_date once per event ---
+    strike_map: Dict[str, Optional[datetime]] = {}
     for i, et in enumerate(ev_to_markets.keys()):
         try:
-            ev = safe_get(f"{KALSHI_BASE}/events/{et}")
+            ev = kalshi_get(auth, f"{KALSHI_PATH_PREFIX}/events/{et}")
             e = ev.get("event", ev) if isinstance(ev, dict) else {}
-            strike_map[et] = iso_to_dt(e.get("strike_date"))
+            strike_map[et] = iso_to_dt(e.get("strike_date") or e.get("strikeDate"))
         except Exception:
             strike_map[et] = None
         if i % 20 == 19:
             time.sleep(0.05)
 
+    # --- 4) infer pair codes per event ---
     out: list[dict] = []
     for et, markets in ev_to_markets.items():
-        pair_candidates: set[Tuple[str,str]] = set()
-        singles: set[str] = set()
-        rep_market_ticker: Optional[str] = None
-
-        # NEW: take pairs directly from event_ticker suffix first
+        # try suffix first: KXNBAGAME-25DEC06BOSORL → BOSORL
+        pair_candidates: set[Tuple[str, str]] = set()
         suf = kalshi_suffix_from_event_ticker(et)
         if suf:
             for p in _candidate_pairs_from_concat(suf):
                 pair_candidates.add(p)
 
-        # Then scan all market tickers for extra hints
+        singles: set[str] = set()
+        rep_market_ticker: Optional[str] = None
+
+        # scan all markets for extra hints
         for m in markets:
             ticker = m.get("ticker") or ""
             ps, ss = _kalshi_pairs_from_ticker(ticker)
             pair_candidates |= ps
             singles |= ss
-            # be less picky picking a representative ticker
             if not rep_market_ticker and ticker:
                 rep_market_ticker = ticker
 
-        # Resolve a pair deterministically
-        pair: Optional[Tuple[str,str]] = None
+        # resolve pair
+        pair: Optional[Tuple[str, str]] = None
         if pair_candidates:
             pair = tuple(sorted(next(iter(pair_candidates))))
         elif len(singles) >= 2:
             a, b = sorted(list(singles))[:2]
             pair = (a, b)
 
-        # Last-resort (should rarely trigger now)
+        # last-resort: try just the suffix
         if not pair and suf:
             cps = list(_candidate_pairs_from_concat(suf))
             if cps:
@@ -401,15 +504,18 @@ def fetch_kalshi_event_pairs_from_markets(debug=False) -> list[dict]:
 
         out.append({
             "kalshi_event_ticker": et,
-            "kalshi_market_ticker": rep_market_ticker,
+            # we'll keep letting the arb watcher decide the exact market,
+            # unless you want to derive TOTAL/SPREAD here as before:
+            "kalshi_market_ticker": rep_market_ticker or "",
             "kalshi_pair_codes": pair,
-            "kalshi_strike": strike_map.get(et)
+            "kalshi_strike": strike_map.get(et),
         })
 
     if debug:
-        print(f"[Kalshi] game events w/ pair codes from tickers: {len(out)}")
+        print(f"[Kalshi] game events w/ pair codes from markets: {len(out)}")
         if out:
             print("[Kalshi] sample:", out[0])
+
     return out
 
 # ---------- Kalshi market ticker derivation from PM slug ----------
@@ -584,7 +690,12 @@ def main():
     ap.add_argument("--out", default="live_sports_matches.csv")
     ap.add_argument("--tol-hours", type=float, default=72)
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--kalshi-key", required=True, help="Kalshi API public key")
+    ap.add_argument("--kalshi-private-key", required=True, help="Path to Kalshi RSA private key (PEM)")
     args = ap.parse_args()
+
+    # build Kalshi auth
+    kalshi_auth = KalshiAuth(api_key=args.kalshi_key, private_key_path=args.kalshi_private_key)
 
     if args.debug:
         print("[Polymarket] fetching Sports + NCAA via tags…")
@@ -598,8 +709,8 @@ def main():
         print("[Debug] PM samples:", pm_df.head(10)[["pm_slug","pm_pair"]].to_dict("records"))
 
     if args.debug:
-        print("[Kalshi] fetching open/unopened single-game markets…")
-    kalshi_rows = fetch_kalshi_event_pairs_from_markets(debug=args.debug)
+        print("[Kalshi] fetching open single-game markets via /markets…")
+    kalshi_rows = fetch_kalshi_event_pairs_from_markets(auth=kalshi_auth, debug=args.debug)
 
     if args.debug and kalshi_rows:
         print("[Debug] Kalshi samples:", kalshi_rows[:5])
