@@ -129,6 +129,7 @@ struct KalshiTradingClient {
 struct PolymarketTradingClient {
     std::string yes_token_id;       // PM YES asset id for this market
     std::string exec_script_path;   // e.g. "/usr/local/bin/pm_place_order.py"
+    std::string pk_path;            // path to PM private key file (optional)
 
     // side: "buy" or "sell"; price in dollars; size in shares.
     bool place_ioc_order(const std::string& side, double price, int size) const;
@@ -244,7 +245,7 @@ struct KalshiBook {
 
         if (!d->contains("quantity_delta") && !d->contains("delta")) return;
 
-        // side/book_side can be "bid"/"ask" or "buy"/"sell"
+        // side/book_side can be "bid"/"ask" or "buy"/"sell" or "yes"/"no"
         std::string side;
         if (d->contains("book_side")) side = (*d)["book_side"].get<std::string>();
         else if (d->contains("side"))  side = (*d)["side"].get<std::string>();
@@ -276,11 +277,20 @@ struct KalshiBook {
         // Map into YES/NO books:
         // - "bid" deltas update YES bid book
         // - "ask" deltas update NO bid book (for YES best ask = 1 - best NO bid)
+        // - "yes" updates YES book, "no" updates NO book
         if (side == "bid" || side == "buy" || side == "b") {
             int new_q = (yes_bid_qty.count(px) ? yes_bid_qty[px] : 0) + dq;
             if (new_q <= 0) yes_bid_qty.erase(px);
             else yes_bid_qty[px] = new_q;
         } else if (side == "ask" || side == "sell" || side == "a") {
+            int new_q = (no_bid_qty.count(px) ? no_bid_qty[px] : 0) + dq;
+            if (new_q <= 0) no_bid_qty.erase(px);
+            else no_bid_qty[px] = new_q;
+        } else if (side == "yes") {
+            int new_q = (yes_bid_qty.count(px) ? yes_bid_qty[px] : 0) + dq;
+            if (new_q <= 0) yes_bid_qty.erase(px);
+            else yes_bid_qty[px] = new_q;
+        } else if (side == "no") {
             int new_q = (no_bid_qty.count(px) ? no_bid_qty[px] : 0) + dq;
             if (new_q <= 0) no_bid_qty.erase(px);
             else no_bid_qty[px] = new_q;
@@ -469,26 +479,6 @@ std::string hmac_sha256_hex(const std::string &key, const std::string &msg) {
     oss << std::hex << std::setfill('0');
     for (unsigned int i=0;i<md_len;++i) oss << std::setw(2) << (int)md[i];
     return oss.str();
-}
-
-// ----- Kalshi auth header maker (adjust to exact spec if needed) -----
-struct KalshiAuth {
-    std::string key;
-    std::string secret; // raw secret string
-};
-
-std::vector<std::pair<std::string,std::string>> make_kalshi_auth_headers(const KalshiAuth &a) {
-    using namespace std::chrono;
-    auto ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    std::string ts_s = std::to_string(ts);
-    // naive string to sign: timestamp + key (adjust for real spec)
-    std::string to_sign = ts_s + a.key;
-    std::string sig = hmac_sha256_hex(a.secret, to_sign);
-    return {
-        {"KALSHI-ACCESS-KEY", a.key},
-        {"KALSHI-ACCESS-SIGNATURE", sig},
-        {"KALSHI-ACCESS-TIMESTAMP", ts_s}
-    };
 }
 
 // ----- shared state for best quotes -----
@@ -877,6 +867,9 @@ int main(int argc, char **argv) {
     // Use Polymarket token-based orderbook subscribe (channels form often accepted)
     std::string pm_sub_template = R"({"type":"subscribe","channels":["orderbook"],"token_id":"{PM_YES_TOKEN}"})";
     std::string pm_sub;
+    // Polymarket executor defaults (can be overridden by CLI)
+    std::string pm_exec = "pm_place_order.py"; // default: relative executable/script
+    std::string pm_pk_path; // optional --pm-pk-path / --pk-path
     // Kalshi orderbook_delta channel (sends snapshot + deltas for a single market)
     std::string kx_sub = R"({
       "id": 1,
@@ -909,6 +902,8 @@ int main(int argc, char **argv) {
         if (a=="--csv" && i+1<argc) csv = argv[++i];
         else if (a=="--row" && i+1<argc) row = std::stoi(argv[++i]);
         else if (a=="--pm-ws" && i+1<argc) pm_ws = argv[++i];
+        else if (a=="--pm-exec" && i+1<argc) pm_exec = argv[++i];
+        else if ((a=="--pm-pk-path" || a=="--pk-path") && i+1<argc) pm_pk_path = argv[++i];
         else if (a=="--kalshi-ws" && i+1<argc) kx_ws = argv[++i];
         else if (a=="--pm-sub" && i+1<argc) pm_sub = argv[++i];
         else if (a=="--kalshi-sub" && i+1<argc) kx_sub = argv[++i];
@@ -1132,8 +1127,10 @@ int main(int argc, char **argv) {
 
     PolymarketTradingClient pm_trader_client;
     pm_trader_client.yes_token_id = pm_yes_token;
-    // Point to the local Python executor that uses py_clob_client. Adjust if you keep it elsewhere.
-    pm_trader_client.exec_script_path = "/home/ubuntu/awsrunner/pm_place_order.py";
+    // Point to the local Python executor that uses py_clob_client. Can be overridden via --pm-exec
+    pm_trader_client.exec_script_path = pm_exec;
+    // Forward optional pk path (if provided via CLI)
+    pm_trader_client.pk_path = pm_pk_path;
 
 
     // Set default ticker for Kalshi trading client so fire_kx("", ...) can fall back to it
@@ -2061,6 +2058,10 @@ bool PolymarketTradingClient::place_ioc_order(const std::string& side, double pr
             << " --price " << std::fixed << std::setprecision(4) << price
             << " --size " << size
             << " --tif IOC";
+        // If caller provided a pk path, forward it explicitly to the python script
+        if (!pk_path.empty()) {
+            cmd << " --pk-path '" << pk_path << "'";
+        }
         int rc = std::system(cmd.str().c_str());
         {
             std::lock_guard lk(out_mtx);
