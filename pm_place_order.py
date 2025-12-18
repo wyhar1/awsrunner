@@ -27,9 +27,12 @@ def load_pk(path: str) -> str:
 
 def make_client(pk: str) -> ClobClient:
     # If you want testnet instead, change host accordingly.
+    # NOTE: py_clob_client.Client signature expects key= (not private_key=).
+    # Add chain_id=137 (Polygon mainnet) which is typical for Polymarket.
     return ClobClient(
-        private_key=pk,
         host="https://clob.polymarket.com",
+        chain_id=137,
+        key=pk,
         signature_type="eip712",
     )
 
@@ -106,4 +109,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
