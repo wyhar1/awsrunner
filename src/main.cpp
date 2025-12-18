@@ -1133,7 +1133,7 @@ int main(int argc, char **argv) {
     PolymarketTradingClient pm_trader_client;
     pm_trader_client.yes_token_id = pm_yes_token;
     // Point to the local Python executor that uses py_clob_client. Adjust if you keep it elsewhere.
-    pm_trader_client.exec_script_path = "/Users/wyattharris/Desktop/Prediction-Exploits/pm_place_order.py";
+    pm_trader_client.exec_script_path = "/home/ubuntu/awsrunner/pm_place_order.py";
 
 
     // Set default ticker for Kalshi trading client so fire_kx("", ...) can fall back to it
