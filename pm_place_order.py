@@ -1,21 +1,32 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import os
+import sys
 import argparse
 import json
+import traceback
 from decimal import Decimal
 
 from py_clob_client.client import ClobClient
 
+# Try to import the types from wherever this version of py_clob_client keeps them
+OrderArgs = None
+Side = None
+TimeInForce = None
+
+try:
+    from py_clob_client.clob_types import OrderArgs, Side, TimeInForce
+except Exception:
+    try:
+        from py_clob_client.types import OrderArgs, Side, TimeInForce
+    except Exception:
+        pass
+
 
 def load_pk(path: str) -> str:
     if not path:
-        env = os.getenv("PM_PK_PATH")
-        if not env:
-            raise SystemExit(
-                "No Polymarket private key provided. "
-                "Set PM_PK_PATH or pass --pk-path."
-            )
-        path = env
+        path = os.getenv("PM_PK_PATH", "")
+    if not path:
+        raise SystemExit("No Polymarket private key provided. Set PM_PK_PATH or pass --pk-path.")
     if not os.path.exists(path):
         raise SystemExit(f"Private key file not found: {path}")
     with open(path, "r") as f:
@@ -26,9 +37,6 @@ def load_pk(path: str) -> str:
 
 
 def make_client(pk: str) -> ClobClient:
-    # If you want testnet instead, change host accordingly.
-    # NOTE: py_clob_client.Client signature expects key= (not private_key=).
-    # Add chain_id=137 (Polygon mainnet) which is typical for Polymarket.
     return ClobClient(
         host="https://clob.polymarket.com",
         chain_id=137,
@@ -38,74 +46,62 @@ def make_client(pk: str) -> ClobClient:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Simple Polymarket CLOB order-placing helper."
-    )
-    p.add_argument("--token-id", required=True, help="CLOB token_id for the outcome")
-    p.add_argument("--side", required=True, choices=["buy", "sell"], help="Order side")
-    p.add_argument(
-        "--price",
-        required=True,
-        type=float,
-        help="Limit price in decimal probability (e.g. 0.54)",
-    )
-    p.add_argument(
-        "--size",
-        required=True,
-        type=float,
-        help="Size (number of shares/contracts)",
-    )
-    p.add_argument(
-        "--tif",
-        default="GTC",
-        choices=["GTC", "IOC", "FOK"],
-        help="Time-in-force (default GTC)",
-    )
-    p.add_argument(
-        "--pk-path",
-        default="",
-        help="Path to private key (overrides PM_PK_PATH if given)",
-    )
-    p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print the order payload instead of sending it.",
-    )
+    p = argparse.ArgumentParser(description="Polymarket CLOB order helper.")
+    p.add_argument("--token-id", required=True)
+    p.add_argument("--side", required=True, choices=["buy", "sell"])
+    p.add_argument("--price", required=True, type=str)
+    p.add_argument("--size", required=True, type=str)
+    p.add_argument("--tif", default="GTC", choices=["GTC", "IOC", "FOK"])
+    p.add_argument("--pk-path", default="")
+    p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    pk = load_pk(args.pk_path)
-
-    client = make_client(pk)
-
-    price = Decimal(str(args.price))
-    size = Decimal(str(args.size))
-
-    # Basic order payload; this shape is accepted by recent py_clob_client versions.
-    order = {
-        "token_id": args.token_id,
-        "side": args.side,           # "buy" or "sell"
-        "price": price,              # Decimal
-        "size": size,                # Decimal
-        "time_in_force": args.tif,   # plain string
-    }
-
-    if args.dry_run:
-        print("DRY RUN. Order payload:")
-        # Decimal isn’t JSON-serializable by default; convert to string
-        print(json.dumps(order, indent=2, default=str))
-        return
-
+def main() -> int:
     try:
-        resp = client.create_order(order)
-        print("Order response:")
+        args = parse_args()
+        pk = load_pk(args.pk_path)
+        client = make_client(pk)
+
+        price = Decimal(args.price)
+        size = Decimal(args.size)
+
+        if OrderArgs is None:
+            raise RuntimeError(
+                "Could not import OrderArgs from py_clob_client. "
+                "Run: python3 -c \"import py_clob_client, pkgutil; print([m.name for m in pkgutil.iter_modules(py_clob_client.__path__)])\""
+            )
+
+        # Map to enums if they exist; otherwise pass raw strings.
+        side_val = Side.BUY if (Side and args.side == "buy") else (Side.SELL if Side else args.side)
+        if TimeInForce:
+            tif_val = getattr(TimeInForce, args.tif)
+        else:
+            tif_val = args.tif
+
+        order_args = OrderArgs(
+            token_id=args.token_id,
+            side=side_val,
+            price=price,
+            size=size,
+            time_in_force=tif_val,
+        )
+
+        if args.dry_run:
+            print("DRY RUN. OrderArgs:")
+            print(repr(order_args))
+            return 0
+
+        resp = client.create_order(order_args)
         print(json.dumps(resp, indent=2, default=str))
+        return 0
+
     except Exception as e:
         print("Error creating order:")
         print(repr(e))
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
