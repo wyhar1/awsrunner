@@ -140,16 +140,22 @@ std::vector<std::pair<std::string,std::string>> make_kalshi_rest_auth_headers(co
                                                                               EVP_PKEY* pkey,
                                                                               const std::string& method,
                                                                               const std::string& path,
-                                                                              const std::string& body = "") {
+                                                                              const std::string& body = "");
+
+// ---- Kalshi auth headers LEGACY (websocket) ----
+// Kept to preserve existing behavior of the arbitrage logic.
+std::vector<std::pair<std::string,std::string>> make_kalshi_auth_headers(
+    const std::string& key_id,
+    EVP_PKEY* pkey,
+    const std::string& path)
+{
     using namespace std::chrono;
-    auto ms   = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    auto ms = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
     std::string ts = std::to_string(ms);
-    const std::string to_sign = ts + method + path + body;
+    // Legacy logic used only timestamp + GET + path for WS auth (no body)
+    const std::string method = "GET";
+    const std::string to_sign = ts + method + path;
     const std::string sig_b64 = sign_pss_base64(pkey, to_sign);
-    if (sig_b64.empty()) {
-        std::lock_guard lk(out_mtx);
-        std::cerr << "[KX] ERROR: Failed to generate REST RSA-PSS signature\n";
-    }
     return {
         {"KALSHI-ACCESS-KEY",       key_id},
         {"KALSHI-ACCESS-SIGNATURE", sig_b64},
@@ -381,49 +387,6 @@ std::string sign_pss_base64(EVP_PKEY* pkey, const std::string& msg) {
 
     sig_b64 = b64_encode(sig.data(), siglen);
     return sig_b64;
-}
-
-std::vector<std::pair<std::string,std::string>> make_kalshi_auth_headers(
-    const std::string& key_id,
-    EVP_PKEY* pkey,
-    const std::string& path)
-{
-    using namespace std::chrono;
-
-    // Get current timestamp in milliseconds
-    auto ms = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    const std::string ts = std::to_string(ms);
-
-    // Log timestamp for clock skew debugging
-    {
-        std::time_t secs = ms / 1000;
-        std::lock_guard lk(out_mtx);
-        std::cerr << "[KX] Generating auth headers: now_ms=" << ms
-                  << " (" << std::put_time(std::gmtime(&secs), "%F %T") << "Z)"
-                  << " path=" << path << "\n";
-    }
-
-    // Build string to sign: timestamp + method + path
-    const std::string to_sign = ts + "GET" + path; // path must be exactly "/trade-api/ws/v2"
-
-    // Generate RSA-PSS signature
-    const std::string sig_b64 = sign_pss_base64(pkey, to_sign);
-
-    // Verify signature was generated successfully
-    if (sig_b64.empty()) {
-        std::lock_guard lk(out_mtx);
-        std::cerr << "[KX] ERROR: Failed to generate RSA-PSS signature! "
-                  << "Check that private key is valid.\n";
-    } else {
-        std::lock_guard lk(out_mtx);
-        std::cerr << "[KX] Signature generated: " << sig_b64.substr(0, 20) << "...\n";
-    }
-
-    return {
-        {"KALSHI-ACCESS-KEY", key_id},
-        {"KALSHI-ACCESS-SIGNATURE", sig_b64},
-        {"KALSHI-ACCESS-TIMESTAMP", ts}
-    };
 }
 
 // ----- utility: simple csv reader -----
@@ -1241,6 +1204,36 @@ int main(int argc, char **argv) {
 
     std::cout << "Stopped cleanly\n";
     return 0;
+}
+
+// We already have sign_pss_base64 and b64_encode and load_private_key_pem defined above.
+// Add this helper to build Kalshi REST auth headers for arbitrary HTTP methods and optional body.
+std::vector<std::pair<std::string,std::string>> make_kalshi_rest_auth_headers(
+    const std::string& key_id,
+    EVP_PKEY* pkey,
+    const std::string& method,
+    const std::string& path,
+    const std::string& body /* = "" */)
+{
+    using namespace std::chrono;
+    auto ms = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    std::string ts = std::to_string(ms);
+
+    // Method must be upper-case in the signature string
+    std::string m = method;
+    for (auto &c : m) c = std::toupper(static_cast<unsigned char>(c));
+
+    // Kalshi REST signing: timestamp + METHOD + path + body
+    // (for GETs with no body, body is empty string)
+    const std::string to_sign = ts + m + path + body;
+
+    const std::string sig_b64 = sign_pss_base64(pkey, to_sign);
+
+    return {
+        {"KALSHI-ACCESS-KEY",       key_id},
+        {"KALSHI-ACCESS-SIGNATURE", sig_b64},
+        {"KALSHI-ACCESS-TIMESTAMP", ts}
+    };
 }
 
 // Restore hydrate_and_normalize_kx_market (categorical contract selection and REST hydration)
@@ -2074,4 +2067,3 @@ bool PolymarketTradingClient::place_ioc_order(const std::string& side, double pr
         return false;
     }
 }
-
