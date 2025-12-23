@@ -7,35 +7,29 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # OpenSSL (Homebrew)
 find_package(OpenSSL REQUIRED)
 
-# Find Boost.System (required for Boost.Asio/Beast linking)
-find_package(Boost 1.70 COMPONENTS system)
-if (NOT Boost_FOUND)
-  message(FATAL_ERROR "Boost not found. Please install Boost (e.g. 'brew install boost') and re-run CMake. Detected Homebrew prefix: $ENV{HOMEBREW_PREFIX}")
-endif()
+# Prefer Homebrew boost headers/libs; project historically used Homebrew includes.
+# Add include for Homebrew
+include_directories(/opt/homebrew/include)
 
 # Include project headers (nlohmann/json.hpp under include/)
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
-# Add Boost include dirs
-include_directories(${Boost_INCLUDE_DIRS})
-
-# We deliberately DO NOT call find_package(Boost ...) anymore.
-# Beast/Asio + System are header-only in modern Boost, so just add include dirs.
-# Homebrew installs headers to /opt/homebrew/include by default.
+# Add Boost include dirs (if Boost found via system it may point elsewhere)
+# We'll prefer Homebrew boost libs to avoid Anaconda conflicts.
 include_directories(/opt/homebrew/include)
-
-# Make sure we don't try to link non-existent Boost::system via auto-linking
-add_definitions(
-  -DBOOST_ERROR_CODE_HEADER_ONLY
-  -DBOOST_SYSTEM_NO_LIB
-  -DBOOST_ASIO_NO_DEPRECATED
-)
 
 add_executable(arb_ws_watcher src/main.cpp)
 
-# Link libraries: Boost.System + OpenSSL
-target_link_libraries(arb_ws_watcher PRIVATE ${Boost_LIBRARIES} OpenSSL::SSL OpenSSL::Crypto)
+# Explicitly link Homebrew libboost_system to avoid linking against Anaconda's boost (which drags a different libc++)
+set(HOMEBREW_BOOST_SYSTEM "/opt/homebrew/lib/libboost_system.dylib")
+if(EXISTS ${HOMEBREW_BOOST_SYSTEM})
+  message(STATUS "Linking against Homebrew boost_system: ${HOMEBREW_BOOST_SYSTEM}")
+  target_link_libraries(arb_ws_watcher PRIVATE ${HOMEBREW_BOOST_SYSTEM} OpenSSL::SSL OpenSSL::Crypto)
+else()
+  message(STATUS "Homebrew boost_system not found at ${HOMEBREW_BOOST_SYSTEM}; falling back to system linking")
+  target_link_libraries(arb_ws_watcher PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
-# On macOS, networking/tls usually doesn't need extra frameworks for this use,
-# but if you ever see unresolved symbols, uncomment:
-# target_link_libraries(arb_ws_watcher PRIVATE "-framework CoreFoundation" "-framework Security")
+add_executable(kalshi_post_test src/kalshi_post_test.cpp)
+# Link with OpenSSL and system libs
+target_link_libraries(kalshi_post_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
