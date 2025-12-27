@@ -171,7 +171,9 @@ void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
                     std::atomic<bool> &stop_flag,
                     int stale_ms, int max_skew_ms, int ping_ms,
                     const std::string& windows_csv,
-                    bool verbose);
+                    bool verbose,
+                    bool exec_polymarket,
+                    bool exec_kalshi);
 
 // ----- Kalshi orderbook maintenance (for delta updates) -----
 struct KalshiBook {
@@ -859,6 +861,8 @@ int main(int argc, char **argv) {
     std::string kalshi_host_override;
     std::string kalshi_sni_host = "api.elections.kalshi.com";
     bool global_verbose = false;
+    bool only_kalshi = false;
+    bool only_polymarket = false;
 
     for (int i=1;i<argc;i++) {
         std::string a = argv[i];
@@ -882,145 +886,166 @@ int main(int argc, char **argv) {
         else if (a=="--kalshi-host-override" && i+1<argc) kalshi_host_override = argv[++i];
         else if (a=="--kalshi-sni-host" && i+1<argc) kalshi_sni_host = argv[++i];
         else if (a=="--verbose") global_verbose = true;
+        else if (a=="--only-kalshi") only_kalshi = true;
+        else if (a=="--only-polymarket") only_polymarket = true;
+    }
+
+    // Execution mode switches
+    // default: both legs; --only-kalshi: only Kalshi; --only-polymarket: only Polymarket
+    bool exec_kalshi = true;
+    bool exec_polymarket = true;
+    if (only_kalshi && !only_polymarket) {
+        exec_polymarket = false;
+    } else if (only_polymarket && !only_kalshi) {
+        exec_kalshi = false;
+    } else {
+        // if both set (or neither), keep both enabled
+        exec_kalshi = true;
+        exec_polymarket = true;
+    }
+    {
+        std::lock_guard lk(out_mtx);
+        std::cerr << "[EXEC] exec_kalshi=" << (exec_kalshi ? "true":"false")
+                  << " exec_polymarket=" << (exec_polymarket ? "true":"false") << "\n";
     }
 
     // Read Kalshi private key (PEM) from --kalshi-secret-path
     EVP_PKEY* kalshi_pkey = nullptr;
     if (!kalshi_secret_path.empty()) {
-        kalshi_pkey = load_private_key_pem(kalshi_secret_path);
-        if (!kalshi_pkey) {
-            std::cerr << "[KX] ERROR: Failed to load private key PEM at " << kalshi_secret_path << "\n";
-            std::cerr << "[KX] Make sure the file is a valid RSA private key in PEM format\n";
-        } else {
-            std::cout << "[KX] Private key loaded successfully from " << kalshi_secret_path << "\n";
-        }
-    }
+         kalshi_pkey = load_private_key_pem(kalshi_secret_path);
+         if (!kalshi_pkey) {
+             std::cerr << "[KX] ERROR: Failed to load private key PEM at " << kalshi_secret_path << "\n";
+             std::cerr << "[KX] Make sure the file is a valid RSA private key in PEM format\n";
+         } else {
+             std::cout << "[KX] Private key loaded successfully from " << kalshi_secret_path << "\n";
+         }
+     }
 
-    // Warn about key/pkey matching
-    if (!kalshi_key.empty() && kalshi_pkey) {
-        std::cout << "[KX] ⚠️  IMPORTANT: Verify that API key '" << kalshi_key.substr(0, 8) << "...'"
-                  << " was generated for the private key in " << kalshi_secret_path << "\n";
-        std::cout << "[KX] If they don't match, you will get 401 Unauthorized errors\n";
-    }
+     // Warn about key/pkey matching
+     if (!kalshi_key.empty() && kalshi_pkey) {
+         std::cout << "[KX] ⚠️  IMPORTANT: Verify that API key '" << kalshi_key.substr(0, 8) << "...'"
+                   << " was generated for the private key in " << kalshi_secret_path << "\n";
+         std::cout << "[KX] If they don't match, you will get 401 Unauthorized errors\n";
+     }
 
-    // read CSV row
-    std::vector<std::string> hdr;
-    auto row_opt = read_csv_row(csv, row, hdr);
-    if (!row_opt) {
-        std::cerr << "Failed to read row " << row << " from " << csv << std::endl;
-        return 2;
-    }
-    auto row_data = *row_opt;
-    // map header->value
-    std::map<std::string,std::string> rowmap;
-    for (size_t i=0;i<hdr.size() && i<row_data.size(); ++i) {
-        rowmap[hdr[i]] = trim_quotes(row_data[i]);
-    }
+     // read CSV row
+     std::vector<std::string> hdr;
+     auto row_opt = read_csv_row(csv, row, hdr);
+     if (!row_opt) {
+         std::cerr << "Failed to read row " << row << " from " << csv << std::endl;
+         return 2;
+     }
+     auto row_data = *row_opt;
+     // map header->value
+     std::map<std::string,std::string> rowmap;
+     for (size_t i=0;i<hdr.size() && i<row_data.size(); ++i) {
+         rowmap[hdr[i]] = trim_quotes(row_data[i]);
+     }
 
-    // Helper to get CSV values
-    auto get = [&](const char* k)->std::string {
-        return rowmap.count(k) ? rowmap[k] : "";
-    };
+     // Helper to get CSV values
+     auto get = [&](const char* k)->std::string {
+         return rowmap.count(k) ? rowmap[k] : "";
+     };
 
-    std::string pm_yes_token = get("pm_yes_token");
-    std::string pm_no_token  = get("pm_no_token");
-    std::string pm_market_id = get("pm_market_id");
+     std::string pm_yes_token = get("pm_yes_token");
+     std::string pm_no_token  = get("pm_no_token");
+     std::string pm_market_id = get("pm_market_id");
 
-    // Read both event and market tickers from CSV
-    std::string kx_event_ticker = get("kalshi_event_ticker");
-    std::string kx_market_ticker = get("kalshi_market_ticker");
+     // Read both event and market tickers from CSV
+     std::string kx_event_ticker = get("kalshi_event_ticker");
+     std::string kx_market_ticker = get("kalshi_market_ticker");
 
-    // Determine which one we actually have
-    std::string kx_ticker;  // Will be set to the market ticker we'll use
-    bool has_market_ticker = !kx_market_ticker.empty();
+     // Determine which one we actually have
+     std::string kx_ticker;  // Will be set to the market ticker we'll use
+     bool has_market_ticker = !kx_market_ticker.empty();
 
-    {
-        std::lock_guard lk(out_mtx);
-        std::cout << "Row " << row << " | pm_market_id=" << pm_market_id
-                  << " | pm_yes_token=" << pm_yes_token
-                  << " | kalshi_event=" << kx_event_ticker
-                  << " | kalshi_market=" << kx_market_ticker << std::endl;
-    }
+     {
+         std::lock_guard lk(out_mtx);
+         std::cout << "Row " << row << " | pm_market_id=" << pm_market_id
+                   << " | pm_yes_token=" << pm_yes_token
+                   << " | kalshi_event=" << kx_event_ticker
+                   << " | kalshi_market=" << kx_market_ticker << std::endl;
+     }
 
-    // Hydrate missing Polymarket tokens via REST API
-    if (pm_yes_token.empty() && !pm_market_id.empty()) {
-        std::cout << "[PM] Token missing, fetching from Gamma API for market " << pm_market_id << "...\n";
-        auto tokens_opt = fetch_pm_tokens(pm_market_id);
-        if (tokens_opt) {
-            pm_yes_token = tokens_opt->yes_token;
-            pm_no_token = tokens_opt->no_token;
-            if (!tokens_opt->market_hex.empty()) {
-                g_pm_market_hex = tokens_opt->market_hex;
-            }
-            std::cout << "[PM] Hydrated tokens: yes=" << pm_yes_token << ", no=" << pm_no_token << "\n";
-            if (!g_pm_market_hex.empty()) std::cout << "[PM] Market hex: "<< g_pm_market_hex <<"\n";
-        } else {
-            std::cerr << "[PM] WARNING: Failed to fetch tokens for market " << pm_market_id << std::endl;
-        }
-    }
+     // Hydrate missing Polymarket tokens via REST API
+     if (pm_yes_token.empty() && !pm_market_id.empty()) {
+         std::cout << "[PM] Token missing, fetching from Gamma API for market " << pm_market_id << "...\n";
+         auto tokens_opt = fetch_pm_tokens(pm_market_id);
+         if (tokens_opt) {
+             pm_yes_token = tokens_opt->yes_token;
+             pm_no_token = tokens_opt->no_token;
+             if (!tokens_opt->market_hex.empty()) {
+                 g_pm_market_hex = tokens_opt->market_hex;
+             }
+             std::cout << "[PM] Hydrated tokens: yes=" << pm_yes_token << ", no=" << pm_no_token << "\n";
+             if (!g_pm_market_hex.empty()) std::cout << "[PM] Market hex: "<< g_pm_market_hex <<"\n";
+         } else {
+             std::cerr << "[PM] WARNING: Failed to fetch tokens for market " << pm_market_id << std::endl;
+         }
+     }
 
-    if (pm_yes_token.empty()) {
-        std::cerr << "[PM] No YES token; relying on market subscription payloads only.\n";
-    }
+     if (pm_yes_token.empty()) {
+         std::cerr << "[PM] No YES token; relying on market subscription payloads only.\n";
+     }
 
-    // Expose hydrated tokens globally for the PM WS parser
-    if (!pm_yes_token.empty()) g_pm_yes_token = pm_yes_token;
-    if (!pm_no_token.empty())  g_pm_no_token  = pm_no_token;
+     // Expose hydrated tokens globally for the PM WS parser
+     if (!pm_yes_token.empty()) g_pm_yes_token = pm_yes_token;
+     if (!pm_no_token.empty())  g_pm_no_token  = pm_no_token;
 
-    // Hydrate and normalize Kalshi market (handles categorical O/U, ticker variations)
-    std::string kx_subscribe_ticker;  // Actual ticker to subscribe to (may be contract ticker)
-    std::string kx_market_type;       // "binary" or "categorical"
-    std::string kx_contract_code;     // "YES", "O", "U", etc.
+     // Hydrate and normalize Kalshi market (handles categorical O/U, ticker variations)
+     std::string kx_subscribe_ticker;  // Actual ticker to subscribe to (may be contract ticker)
+     std::string kx_market_type;       // "binary" or "categorical"
+     std::string kx_contract_code;     // "YES", "O", "U", etc.
 
-    if (!kalshi_key.empty() && kalshi_pkey) {
-        // Fix C: If we only have event ticker, convert it to market ticker first
-        std::string raw_ticker;
-        if (!has_market_ticker && !kx_event_ticker.empty()) {
-            std::cout << "[KX] Converting event ticker to market ticker...\n";
-            auto mt = fetch_kalshi_market_ticker_from_event(kx_event_ticker, kalshi_key, kalshi_pkey);
-            if (mt) {
-                raw_ticker = *mt;  // now a real market ticker
-                std::cout << "[KX] Resolved event to market: " << raw_ticker << "\n";
-            } else {
-                std::cerr << "[KX] Could not resolve a market ticker from event ticker.\n";
-            }
-        }
+     if (!kalshi_key.empty() && kalshi_pkey) {
+         // Fix C: If we only have event ticker, convert it to market ticker first
+         std::string raw_ticker;
+         if (!has_market_ticker && !kx_event_ticker.empty()) {
+             std::cout << "[KX] Converting event ticker to market ticker...\n";
+             auto mt = fetch_kalshi_market_ticker_from_event(kx_event_ticker, kalshi_key, kalshi_pkey);
+             if (mt) {
+                 raw_ticker = *mt;  // now a real market ticker
+                 std::cout << "[KX] Resolved event to market: " << raw_ticker << "\n";
+             } else {
+                 std::cerr << "[KX] Could not resolve a market ticker from event ticker.\n";
+             }
+         }
 
-        // Fall back to what we have in CSV if conversion didn't work
-        if (raw_ticker.empty()) {
-            raw_ticker = has_market_ticker ? kx_market_ticker : kx_event_ticker;
-        }
+         // Fall back to what we have in CSV if conversion didn't work
+         if (raw_ticker.empty()) {
+             raw_ticker = has_market_ticker ? kx_market_ticker : kx_event_ticker;
+         }
 
-        if (!raw_ticker.empty()) {
-            std::cout << "[KX] Hydrating and normalizing ticker=" << raw_ticker << "...\n";
-            auto kx_info = hydrate_and_normalize_kx_market(raw_ticker, kalshi_key, kalshi_pkey);
+         if (!raw_ticker.empty()) {
+             std::cout << "[KX] Hydrating and normalizing ticker=" << raw_ticker << "...\n";
+             auto kx_info = hydrate_and_normalize_kx_market(raw_ticker, kalshi_key, kalshi_pkey);
 
-            if (kx_info) {
-                kx_subscribe_ticker = kx_info->subscribe_ticker;
-                kx_market_type = kx_info->market_type;
-                kx_contract_code = kx_info->contract_code;
+             if (kx_info) {
+                 kx_subscribe_ticker = kx_info->subscribe_ticker;
+                 kx_market_type = kx_info->market_type;
+                 kx_contract_code = kx_info->contract_code;
 
-                std::cout << "[KX] Normalized: subscribe_ticker=" << kx_subscribe_ticker
-                          << " type=" << kx_market_type
-                          << " contract=" << kx_contract_code << "\n";
+                 std::cout << "[KX] Normalized: subscribe_ticker=" << kx_subscribe_ticker
+                           << " type=" << kx_market_type
+                           << " contract=" << kx_contract_code << "\n";
 
-                // Log which side we matched (for totals)
-                if (kx_market_type == "categorical") {
-                    std::cout << "[KX] Contract side = " << kx_contract_code
-                              << " (assume PM YES matches " << (kx_contract_code=="U"?"Under":"Over") << ")\n";
-                }
+                 // Log which side we matched (for totals)
+                 if (kx_market_type == "categorical") {
+                     std::cout << "[KX] Contract side = " << kx_contract_code
+                               << " (assume PM YES matches " << (kx_contract_code=="U"?"Under":"Over") << ")\n";
+                 }
 
-                // Echo the final ticker we'll subscribe to
-                std::cout << "[KX] Will subscribe to ticker: " << kx_subscribe_ticker << "\n";
-            } else {
-                std::cerr << "[KX] WARNING: Could not hydrate/normalize ticker; KX quotes may remain empty.\n";
-            }
-        }
-    }
+                 // Echo the final ticker we'll subscribe to
+                 std::cout << "[KX] Will subscribe to ticker: " << kx_subscribe_ticker << "\n";
+             } else {
+                 std::cerr << "[KX] WARNING: Could not hydrate/normalize ticker; KX quotes may remain empty.\n";
+             }
+         }
+     }
 
-    // Use subscribe_ticker for WS, fall back to raw if hydration failed
-    kx_ticker = !kx_subscribe_ticker.empty() ? kx_subscribe_ticker :
-                (has_market_ticker ? kx_market_ticker : kx_event_ticker);
+     // Use subscribe_ticker for WS, fall back to raw if hydration failed
+     kx_ticker = !kx_subscribe_ticker.empty() ? kx_subscribe_ticker :
+                 (has_market_ticker ? kx_market_ticker : kx_event_ticker);
 
     // Normalize Polymarket WS URL (subscriptions gateway wants /ws/market)
     auto normalize_pm_ws = [](const std::string& s) -> std::string {
@@ -1189,7 +1214,8 @@ int main(int argc, char **argv) {
     });
     std::thread t_arb([&](){
         arbitrage_loop(pm_q, kx_q, pm_trader_client, kx_trader_client, pm_fee_bps, kx_fee_bps, min_edge_bps, stop_flag,
-                       stale_ms, max_skew_ms, ping_ms, windows_csv, global_verbose);
+                       stale_ms, max_skew_ms, ping_ms, windows_csv, global_verbose,
+                       exec_polymarket, exec_kalshi);
     });
 
     // ctrl-c handling: simple wait for Enter to quit
@@ -1223,9 +1249,11 @@ std::vector<std::pair<std::string,std::string>> make_kalshi_rest_auth_headers(
     std::string m = method;
     for (auto &c : m) c = std::toupper(static_cast<unsigned char>(c));
 
-    // Kalshi REST signing: timestamp + METHOD + path + body
-    // (for GETs with no body, body is empty string)
-    const std::string to_sign = ts + m + path + body;
+    // IMPORTANT: Align with working Python client behavior:
+    // sign only timestamp + METHOD + path (no body), at least for
+    // trade-api/v2/portfolio/orders. Including the JSON body here
+    // causes INCORRECT_API_KEY_SIGNATURE from Kalshi.
+    const std::string to_sign = ts + m + path;
 
     const std::string sig_b64 = sign_pss_base64(pkey, to_sign);
 
@@ -1663,7 +1691,7 @@ void run_ws_watch(
             if (verbose) { std::lock_guard lk(out_mtx); std::cerr << "["<<label<<"] exception: "<<e.what()<<"\n"; }
         }
         if (stop_flag.load()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(5000, 250 * std::max(1, ++attempt))));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 
@@ -1770,7 +1798,9 @@ void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
                     std::atomic<bool> &stop_flag,
                     int stale_ms, int max_skew_ms, int ping_ms,
                     const std::string& windows_csv,
-                    bool verbose)
+                    bool verbose,
+                    bool exec_polymarket,
+                    bool exec_kalshi)
 {
     using clock = std::chrono::steady_clock;
     auto heartbeat_interval = std::chrono::seconds(5); // fixed heartbeat every 5s
@@ -1912,12 +1942,40 @@ void arbitrage_loop(QuoteBook &pm_q, QuoteBook &kx_q,
                                 }
                                 if (std::string(label) == "PM->KX") {
                                     // PM sell at sell_bid2, KX buy at buy_ask2
-                                    fire_pm("", sell_bid2, shares);
-                                    fire_kx("", "buy", buy_ask2, shares);
+                                    if (exec_polymarket) {
+                                        fire_pm("", sell_bid2, shares);
+                                    } else if (verbose) {
+                                        std::lock_guard lk(out_mtx);
+                                        std::cerr << "[EXEC] PM leg suppressed (PM->KX) would_sell@" << sell_bid2
+                                                  << " qty=" << shares << "\n";
+                                    }
+
+                                    if (exec_kalshi) {
+                                        fire_kx("", "buy", buy_ask2, shares);
+                                    } else if (verbose) {
+                                        std::lock_guard lk(out_mtx);
+                                        std::cerr << "[EXEC] KX leg suppressed (PM->KX) would_buy@" << buy_ask2
+                                                  << " qty=" << shares << "\n";
+                                    }
                                 } else if (std::string(label) == "KX->PM") {
                                     // KX sell at sell_bid2, PM buy at buy_ask2
-                                    fire_kx("", "sell", sell_bid2, shares);
-                                    fire_pm("", buy_ask2, shares);
+                                    if (exec_kalshi) {
+                                        fire_kx("", "sell", sell_bid2, shares);
+                                    } else if (verbose) {
+                                        std::lock_guard lk(out_mtx);
+                                        std::cerr << "[EXEC] KX leg suppressed (KX->PM) would_sell@" << sell_bid2
+                                                  << " qty=" << shares << "\n";
+                                    }
+
+                                    if (exec_polymarket) {
+                                        // NOTE: fire_pm currently always submits a sell; if you need PM BUY semantics,
+                                        // you should extend fire_pm/place_ioc_order to accept side.
+                                        fire_pm("", buy_ask2, shares);
+                                    } else if (verbose) {
+                                        std::lock_guard lk(out_mtx);
+                                        std::cerr << "[EXEC] PM leg suppressed (KX->PM) would_buy@" << buy_ask2
+                                                  << " qty=" << shares << "\n";
+                                    }
                                 }
                             } else {
                                 if (attempt == 0 && verbose) {
@@ -1999,13 +2057,29 @@ bool KalshiTradingClient::place_ioc_order(const std::string& ticker,
 
         const std::string path = "/trade-api/v2/portfolio/orders";
 
+        // Map our arbitrary side ("BUY"/"SELL") into Kalshi's action+side.
+        // For binary YES contracts, we treat everything as YES side and vary action.
+        std::string action = "buy";   // "buy" or "sell"
+        std::string kx_side = "yes";  // "yes" or "no" (we stick to yes)
+        if (!side.empty()) {
+            std::string s_up = boost::to_upper_copy(side);
+            if (s_up == "SELL" || s_up == "S") action = "sell";
+        }
+
+        // Kalshi expects integer yes_price in cents (e.g., 31 for $0.31)
+        int yes_price_cents = static_cast<int>(std::round(price * 100.0));
+        if (yes_price_cents < 1) yes_price_cents = 1;
+        if (yes_price_cents > 99) yes_price_cents = 99;
+
+        // Use immediate_or_cancel for IOC
         json body = {
-            {"ticker", ticker},
-            {"side",   side},
-            {"type",   "LIMIT"},
-            {"time_in_force", "IOC"},
-            {"size",   size},
-            {"limit_price", price}
+            {"ticker",        ticker},
+            {"action",        action},          // "buy" / "sell"
+            {"side",          kx_side},         // "yes" / "no" (we stick to yes)
+            {"count",         size},            // number of contracts
+            {"type",          "limit"},        // limit order
+            {"yes_price",     yes_price_cents}, // integer cents
+            {"time_in_force", "immediate_or_cancel"}
         };
         const std::string body_str = body.dump();
 
@@ -2025,7 +2099,8 @@ bool KalshiTradingClient::place_ioc_order(const std::string& ticker,
         http::read(tls_stream, buffer, res);
         {
             std::lock_guard lk(out_mtx);
-            std::cerr << "[KX-TRADE] HTTP " << static_cast<unsigned>(res.result()) << " body=" << res.body() << "\n";
+            std::cerr << "[KX-TRADE] HTTP " << static_cast<unsigned>(res.result())
+                      << " body=" << res.body() << "\n";
         }
         beast::error_code ec;
         tls_stream.shutdown(ec);
@@ -2044,6 +2119,7 @@ bool PolymarketTradingClient::place_ioc_order(const std::string& side, double pr
         return false;
     }
     try {
+        // pm_place_order.py expects: --token-id, --side {buy,sell}, --price, --size, --tif {GTC,IOC,FOK}, [--pk-path]
         std::ostringstream cmd;
         cmd << "python3 '" << exec_script_path << "'"
             << " --token-id '" << yes_token_id << "'"
@@ -2051,7 +2127,6 @@ bool PolymarketTradingClient::place_ioc_order(const std::string& side, double pr
             << " --price " << std::fixed << std::setprecision(4) << price
             << " --size " << size
             << " --tif IOC";
-        // If caller provided a pk path, forward it explicitly to the python script
         if (!pk_path.empty()) {
             cmd << " --pk-path '" << pk_path << "'";
         }
